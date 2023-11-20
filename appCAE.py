@@ -83,3 +83,27 @@ ANALYSIS_PRESETS = {
         "default_direction": "+Y",
     },
 }
+
+
+def get_analysis_preset(analysis_type):
+    return ANALYSIS_PRESETS.get(analysis_type, ANALYSIS_PRESETS["Статический"])
+
+
+def get_engineering_recommendations(analysis_type, max_stress_val, safety_factor, temperature, direction, load_type):
+    recommendations = []
+    if safety_factor < 1.0:
+        recommendations.append("Снизить уровень нагрузки или изменить зону приложения силы.")
+    elif safety_factor < 1.3:
+        recommendations.append("Проверить зону концентрации напряжений и уточнить граничные условия.")
+    else:
+        recommendations.append("Сохранить текущую схему и проверить чувствительность к температуре и направлению.")
+
+    if temperature > 200:
+        recommendations.append("Проверить термоупругие эффекты и свойства материала при повышенной температуре.")
+    if analysis_type in {"Модальный", "Спектральный"}:
+        recommendations.append("Уточнить частотный отклик и возможный резонанс относительно режима возбуждения.")
+    if load_type == "Сейсмика":
+        recommendations.append("Проверить спектральное воздействие и направление возбуждения.")
+    if direction in {"+X", "-X", "+Y", "-Y"}:
+        recommendations.append("Сравнить результат с альтернативным направлением, чтобы оценить чувствительность.")
+    return recommendations

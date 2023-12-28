@@ -262,3 +262,197 @@ def _safe_max_stress(*arrays):
         except Exception:
             continue
     return max(values) if values else 0.0
+
+
+def load_step_to_trimesh(file_bytes):
+    try:
+        step_path = "/tmp/vibecae_step.step"
+        with open(step_path, "wb") as fh:
+            fh.write(file_bytes)
+
+        shape = cq.importers.importStep(step_path)
+        if shape is None:
+            return None
+
+        if hasattr(shape, "Solids"):
+            solid = shape.Solids().val()
+        else:
+            solid = shape
+
+        if solid is None:
+            return None
+
+        from OCP.STEPControl import STEPControl_Reader
+        from OCP.IFSelect import IFSelect_RetDone
+        from OCP import TopoDS
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.BRep import BRep_Tool
+        from OCP.gp import gp_Pnt
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopLoc import TopLoc_Location
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.GeomAbs import GeomAbs_Plane
+
+        reader = STEPControl_Reader()
+        status = reader.ReadFile(step_path)
+        if status != IFSelect_RetDone:
+            return None
+
+        reader.TransferRoot(1)
+        shape = reader.Shape(1)
+
+        if not shape.IsNull():
+            from OCP.TopoDS import TopoDS_Shape
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.BRepTools import BRepTools
+            from OCP.BRep import BRep_Tool
+            from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.gp import gp_Pnt
+            import numpy as np
+
+            explorer = TopExp_Explorer(shape, TopAbs_FACE)
+            faces = []
+            while explorer.More():
+                face = explorer.Current()
+                faces.append(face)
+                explorer.Next()
+
+            if not faces:
+                return None
+
+            verts = []
+            faces_idx = []
+            current_offset = 0
+            for face in faces:
+                try:
+                    mesh = BRepMesh_IncrementalMesh(face, 0.5)
+                    mesh.Perform()
+                    triangulation = BRep_Tool.Triangulation(face, TopLoc_Location())
+                    if triangulation is None:
+                        continue
+                    for i in range(1, triangulation.NbNodes() + 1):
+                        pnt = triangulation.Node(i).Transformed(TopLoc_Location())
+                        verts.append((pnt.X(), pnt.Y(), pnt.Z()))
+                    for i in range(1, triangulation.NbTriangles() + 1):
+                        tri = triangulation.Triangle(i)
+                        n1 = tri.Get(1) - 1
+                        n2 = tri.Get(2) - 1
+                        n3 = tri.Get(3) - 1
+                        faces_idx.append((current_offset + n1, current_offset + n2, current_offset + n3))
+                    current_offset += triangulation.NbNodes()
+                except Exception:
+                    continue
+
+            if not verts:
+                return None
+
+            return trimesh.Trimesh(vertices=np.array(verts), faces=np.array(faces_idx), process=False)
+
+        return None
+    except Exception as e:
+        st.warning(f"Не удалось прочитать STEP: {e}")
+        return None
+
+
+def build_mesh_from_uploaded_model(mesh, element_size_mm):
+    if mesh is None:
+        return None
+
+    try:
+        mesh_copy = mesh.copy()
+        mesh_copy.remove_degenerate_faces()
+        mesh_copy.remove_unreferenced_vertices()
+        if len(mesh_copy.faces) == 0:
+            return mesh
+
+        if element_size_mm is None:
+            return mesh_copy
+
+        size_mm = float(element_size_mm)
+        target_edge = max(size_mm, 0.01)
+
+        try:
+            verts, faces = trimesh.remesh.subdivide_to_size(
+                mesh_copy.vertices,
+                mesh_copy.faces,
+                max_edge=target_edge,
+                max_iter=10,
+            )
+            return trimesh.Trimesh(vertices=verts, faces=faces)
+        except Exception:
+            try:
+                verts, faces = trimesh.remesh.subdivide(
+                    mesh_copy.vertices,
+                    mesh_copy.faces,
+                    return_index=False,
+                )
+                return trimesh.Trimesh(vertices=verts, faces=faces)
+            except Exception:
+                return mesh_copy
+    except Exception:
+        return mesh
+
+
+def build_mesh_figure(mesh, title="Сетка на модели"):
+    if mesh is None:
+        return None
+
+    vertices = mesh.vertices
+    faces = mesh.faces
+
+    fig = go.Figure()
+    fig.add_trace(go.Mesh3d(
+        x=vertices[:, 0],
+        y=vertices[:, 1],
+        z=vertices[:, 2],
+        i=faces[:, 0],
+        j=faces[:, 1],
+        k=faces[:, 2],
+        color='lightblue',
+        opacity=0.35,
+        flatshading=True,
+        hoverinfo='skip'
+    ))
+
+    try:
+        edges = mesh.edges_unique
+        if len(edges) > 0:
+            x_lines = np.empty(3 * len(edges), dtype=float)
+            y_lines = np.empty(3 * len(edges), dtype=float)
+            z_lines = np.empty(3 * len(edges), dtype=float)
+
+            x_lines[0::3] = vertices[edges[:, 0], 0]
+            x_lines[1::3] = vertices[edges[:, 1], 0]
+            x_lines[2::3] = np.nan
+
+            y_lines[0::3] = vertices[edges[:, 0], 1]
+            y_lines[1::3] = vertices[edges[:, 1], 1]
+            y_lines[2::3] = np.nan
+
+            z_lines[0::3] = vertices[edges[:, 0], 2]
+            z_lines[1::3] = vertices[edges[:, 1], 2]
+            z_lines[2::3] = np.nan
+
+            fig.add_trace(go.Scatter3d(
+                x=x_lines,
+                y=y_lines,
+                z=z_lines,
+                mode='lines',
+                line=dict(color='rgba(20, 60, 120, 0.95)', width=1.2),
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+    except Exception:
+        pass
+
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
+        margin=dict(l=0, r=0, b=0, t=40),
+        height=500,
+    )
+    return fig

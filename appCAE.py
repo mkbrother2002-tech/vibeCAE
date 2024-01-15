@@ -456,3 +456,103 @@ def build_mesh_figure(mesh, title="Сетка на модели"):
         height=500,
     )
     return fig
+
+
+def get_region_mask(mesh, load_params):
+    if mesh is None:
+        return np.ones(0, dtype=bool)
+
+    coords = mesh.vertices[:, :3]
+    region_mode = load_params.get("region_mode", "Автоматическая зона")
+    if region_mode == "Выделено мышью":
+        selected_points = load_params.get("selection_points", [])
+        radius = float(load_params.get("selection_radius", 1.0))
+        if selected_points:
+            selected_coords = np.asarray(selected_points, dtype=float)
+            if selected_coords.ndim == 1:
+                selected_coords = selected_coords.reshape(1, -1)
+            dist = np.linalg.norm(coords[:, None, :] - selected_coords[None, :, :], axis=2)
+            mask = np.any(dist <= radius, axis=1)
+            if np.any(mask):
+                return mask
+        return np.ones(len(coords), dtype=bool)
+
+    if region_mode != "Пользовательская область":
+        return np.ones(len(coords), dtype=bool)
+
+    axis = load_params.get("region_axis", "Z")
+    axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(axis, 2)
+    region_min = float(load_params.get("region_min", np.min(coords[:, axis_idx])))
+    region_max = float(load_params.get("region_max", np.max(coords[:, axis_idx])))
+    if region_min > region_max:
+        region_min, region_max = region_max, region_min
+
+    mask = (coords[:, axis_idx] >= region_min) & (coords[:, axis_idx] <= region_max)
+    return mask if np.any(mask) else np.ones(len(coords), dtype=bool)
+
+
+def get_load_center(mesh, load_params):
+    if mesh is None:
+        return np.array([0.0, 0.0, 0.0])
+
+    coords = mesh.vertices[:, :3]
+    region_mask = get_region_mask(mesh, load_params)
+    active_points = coords[region_mask] if np.any(region_mask) else coords
+
+    location = load_params.get("location", "Центральная зона")
+    if location == "Верхняя поверхность":
+        z_max = np.max(active_points[:, 2])
+        subset = active_points[np.isclose(active_points[:, 2], z_max, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else active_points.mean(axis=0)
+    if location == "Нижняя поверхность":
+        z_min = np.min(active_points[:, 2])
+        subset = active_points[np.isclose(active_points[:, 2], z_min, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else active_points.mean(axis=0)
+    if location == "Боковая поверхность":
+        x_abs_max = np.max(np.abs(active_points[:, 0]))
+        subset = active_points[np.isclose(np.abs(active_points[:, 0]), x_abs_max, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else active_points.mean(axis=0)
+    return active_points.mean(axis=0)
+
+
+def get_direction_vector(direction):
+    direction_map = {
+        "+X": np.array([1.0, 0.0, 0.0]),
+        "-X": np.array([-1.0, 0.0, 0.0]),
+        "+Y": np.array([0.0, 1.0, 0.0]),
+        "-Y": np.array([0.0, -1.0, 0.0]),
+        "+Z": np.array([0.0, 0.0, 1.0]),
+        "-Z": np.array([0.0, 0.0, -1.0]),
+    }
+    return direction_map.get(direction, np.array([0.0, 0.0, 1.0]))
+
+
+def build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=6000.0):
+    if mesh is None or not load_params:
+        return None
+
+    coords = mesh.vertices[:, :3]
+    center = get_load_center(mesh, load_params)
+    direction = get_direction_vector(load_params.get("direction", "+Z"))
+    magnitude = float(load_params.get("magnitude", 1.0))
+
+    delta = coords - center
+    dist = np.linalg.norm(delta, axis=1)
+    size_scale = max(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)) / 6.0, 1e-3)
+
+    region_mask = get_region_mask(mesh, load_params)
+    influence = np.exp(-dist / max(size_scale, 1e-3))
+    influence = np.where(region_mask, influence, 0.0)
+
+    projection = np.einsum('ij,j->i', delta, direction)
+    projection = np.clip(projection / max(size_scale, 1e-3), -1.0, 1.0)
+
+    surface_alignment = np.abs(np.einsum('ij,j->i', delta, direction)) / np.maximum(dist, 1e-6)
+    surface_alignment = np.clip(surface_alignment, 0.0, 1.0)
+
+    directional_bias = 1.0 + 0.8 * np.maximum(projection, 0.0)
+    tangential_penalty = 1.0 - 0.45 * np.maximum(0.0, 1.0 - surface_alignment)
+
+    stress = base_stress + magnitude * 20.0 * influence * directional_bias * tangential_penalty
+    stress = np.clip(stress, 0.0, max_stress)
+    return stress

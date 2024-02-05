@@ -556,3 +556,156 @@ def build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=600
     stress = base_stress + magnitude * 20.0 * influence * directional_bias * tangential_penalty
     stress = np.clip(stress, 0.0, max_stress)
     return stress
+
+# Боковая панель
+with st.sidebar:
+    selected_material = st.selectbox("Материал конструкции (ГОСТ)", list(MATERIALS_GOST.keys()))
+    material_data = MATERIALS_GOST[selected_material]
+    st.caption(f"_{material_data['desc']}_")
+    st.caption(f"Предел текучести: {material_data['yield_strength']} МПа")
+
+    st.markdown("---")
+    st.caption("Быстрый материал для черновика")
+    quick_material = st.selectbox("Быстрый выбор материала", list(MATERIALS_QUICK.keys()), key="quick_material")
+    quick_material_data = MATERIALS_QUICK[quick_material]
+    st.caption(f"E = {quick_material_data['elastic_modulus']} ГПа | ν = {quick_material_data['poisson']:.2f}")
+    st.caption(f"σy = {quick_material_data['yield_strength']} МПа")
+
+    st.markdown("---")
+    st.markdown("*Статус: Компонентный FEA-режим*")
+
+# Вкладки интерфейса
+tab1, tab2, tab3 = st.tabs([
+    "1. Импорт CAD и КЭМ", 
+    "2. Сценарии нагружения", 
+    "3. Анализ НДС & Отчет"
+])
+
+if 'mesh_built' not in st.session_state:
+    st.session_state['mesh_built'] = False
+if 'mesh_build_key' not in st.session_state:
+    st.session_state['mesh_build_key'] = None
+if 'exp_done' not in st.session_state:
+    st.session_state['exp_done'] = False
+if 'test_done' not in st.session_state:
+    st.session_state['test_done'] = False
+if 'stl_mesh' not in st.session_state:
+    st.session_state['stl_mesh'] = None
+if 'stl_name' not in st.session_state:
+    st.session_state['stl_name'] = None
+if 'active_mesh' not in st.session_state:
+    st.session_state['active_mesh'] = None
+if 'mesh_element_size' not in st.session_state:
+    st.session_state['mesh_element_size'] = 2.0
+if 'exp_load' not in st.session_state:
+    st.session_state['exp_load'] = None
+if 'test_load' not in st.session_state:
+    st.session_state['test_load'] = None
+if 'selected_region_points' not in st.session_state:
+    st.session_state['selected_region_points'] = []
+
+# --- ВКЛАДКА 1: ИМПОРТ И АВТОМАТИЧЕСКОЕ ПОСТРОЕНИЕ СЕТКИ ---
+with tab1:
+    st.header("Подготовка конечно-элементной модели")
+    st.write("Загрузите CAD-модель или STL-файл, и сетка будет строиться автоматически на основе загруженной геометрии.")
+    
+    uploaded_file = st.file_uploader(
+        "Перетащите CAD-модель сюда или выберите файл (.stp, .step, .stl, .parasolid)", 
+        type=["stp", "step", "stl", "x_t"],
+        key="permanent_cad_uploader"
+    )
+    st.caption("Если удобнее, нажмите кнопку выбора файла или просто перетащите модель в область загрузки.")
+    
+    if uploaded_file:
+        st.info(f"Файл `{uploaded_file.name}` успешно загружен. Сетка будет построена автоматически.")
+
+        if st.session_state.get('stl_name') != uploaded_file.name:
+            try:
+                if uploaded_file.name.lower().endswith('.stl'):
+                    mesh_bytes = uploaded_file.getvalue()
+                    mesh = trimesh.load(BytesIO(mesh_bytes), file_type='stl', force='mesh')
+                    if isinstance(mesh, trimesh.Scene):
+                        mesh = mesh.dump(concatenate=True)
+                    st.session_state['stl_mesh'] = mesh
+                    st.session_state['stl_name'] = uploaded_file.name
+                    st.session_state['active_mesh'] = mesh
+                    st.session_state['mesh_build_key'] = None
+                    st.success("STL-файл прочитан. Сетка будет построена автоматически.")
+                elif uploaded_file.name.lower().endswith(('.step', '.stp')):
+                    mesh = load_step_to_trimesh(uploaded_file.getvalue())
+                    if mesh is not None:
+                        st.session_state['stl_mesh'] = mesh
+                        st.session_state['stl_name'] = uploaded_file.name
+                        st.session_state['active_mesh'] = mesh
+                        st.session_state['mesh_build_key'] = None
+                        st.success("STEP-файл прочитан. Сетка будет построена автоматически.")
+                    else:
+                        st.warning("Не удалось обработать STEP-файл. Проверьте геометрию файла или попробуйте экспорт в STL.")
+                        st.session_state['stl_mesh'] = None
+                        st.session_state['stl_name'] = uploaded_file.name
+                        st.session_state['active_mesh'] = None
+                        st.session_state['mesh_build_key'] = None
+                else:
+                    st.warning("В текущей версии приложения автоматическое построение сетки поддерживается для STL и STEP.")
+                    st.session_state['stl_mesh'] = None
+                    st.session_state['stl_name'] = uploaded_file.name
+                    st.session_state['active_mesh'] = None
+                    st.session_state['mesh_build_key'] = None
+            except Exception as e:
+                st.error(f"Не удалось загрузить модель: {e}")
+
+    col_mesh1, col_mesh2 = st.columns([1, 2])
+    with col_mesh1:
+        st.subheader("Параметры конечных элементов")
+        element_size = st.slider("Размер ячейки/разбиения (мм)", 0.5, 10.0, st.session_state['mesh_element_size'], 0.5)
+        mesh_type = st.radio("Тип конечных элементов", ["SOLID186 (3D 20-узловые гексаэдры)", "SOLID185 (Линейные блоки)"])
+        st.caption("Меньшее значение — более мелкая сетка, большее — более крупная.")
+        
+        if st.session_state['stl_mesh'] is None:
+            st.info("Сначала загрузите CAD-модель или STL-файл.")
+        else:
+            mesh_key = (st.session_state['stl_name'], round(element_size, 2), mesh_type)
+            if st.session_state.get('mesh_build_key') != mesh_key:
+                with st.spinner("Построение сетки на загруженной модели..."):
+                    st.session_state['active_mesh'] = build_mesh_from_uploaded_model(st.session_state['stl_mesh'], element_size)
+                    st.session_state['mesh_built'] = True
+                    st.session_state['mesh_element_size'] = element_size
+                    st.session_state['mesh_build_key'] = mesh_key
+                st.success(f"Сетка построена автоматически на модели {st.session_state['stl_name']}.")
+            else:
+                st.caption("Сетка уже построена для текущих параметров.")
+            
+    with col_mesh2:
+        if st.session_state['stl_mesh'] is not None:
+            mesh = st.session_state.get('active_mesh') or st.session_state['stl_mesh']
+            st.subheader("Сетка на загруженной модели")
+            st.write(f"Файл: {st.session_state['stl_name']}")
+            st.write(f"Вершин: {len(mesh.vertices):,} | Треугольников: {len(mesh.faces):,}")
+            st.write(f"Параметр разбиения: {element_size:.2f} мм")
+
+            fig_stl = build_mesh_figure(mesh, title="Треугольная сетка на модели")
+            vertex_coords = mesh.vertices[:, :3]
+            fig_stl.add_trace(go.Scatter3d(
+                x=vertex_coords[:, 0],
+                y=vertex_coords[:, 1],
+                z=vertex_coords[:, 2],
+                mode='markers',
+                marker=dict(size=2.2, color='rgba(15, 60, 120, 0.85)'),
+                hoverinfo='skip',
+                customdata=np.arange(len(vertex_coords)),
+                name='vertices'
+            ))
+            st.plotly_chart(fig_stl, use_container_width=True, key="mesh_preview_chart")
+            st.caption("Выберите область приложения силы через координаты модели.")
+            if st.button("Сохранить текущую область как выделенную", key="save_region_selection"):
+                if len(vertex_coords) > 0:
+                    center_point = vertex_coords[np.argmin(np.linalg.norm(vertex_coords - vertex_coords.mean(axis=0), axis=1))]
+                    st.session_state['selected_region_points'] = [center_point.tolist()]
+                    st.success("Выделена центральная точка модели. Она будет использоваться как область приложения силы.")
+                else:
+                    st.warning("Нет доступных вершин для выделения.")
+            if st.button("Очистить выделение", key="clear_region_selection"):
+                st.session_state['selected_region_points'] = []
+                st.rerun()
+        else:
+            st.info("Загрузите CAD-модель или STL-файл, чтобы увидеть геометрию и построить на ней сетку.")

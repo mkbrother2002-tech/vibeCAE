@@ -709,3 +709,77 @@ with tab1:
                 st.rerun()
         else:
             st.info("Загрузите CAD-модель или STL-файл, чтобы увидеть геометрию и построить на ней сетку.")
+
+# --- ВКЛАДКА 2: СЦЕНАРИИ НАГРУЖЕНИЯ ---
+with tab2:
+    st.header("Сценарии нагружения по ТЗ заказчика")
+    st.write("Выберите один или несколько сценариев, которые требуется проверить для модели оборудования.")
+
+    scenario_options = [
+        "1. Состояние покоя",
+        "2. Эксплуатация",
+        "3. Модальный анализ — пустое оборудование",
+        "4. Модальный анализ — загруженное оборудование",
+        "5. Проверка прочности — пустое оборудование",
+        "6. Проверка прочности — пустое оборудование, с учётом динамических эффектов",
+        "7. Проверка прочности — загруженное оборудование",
+        "8. Проверка прочности — загруженное оборудование, с учётом динамических эффектов",
+        "9. Проверка прочности — рабочая мощность",
+        "10. Проверка прочности — рабочая мощность, с учётом динамических эффектов"
+    ]
+
+    selected_scenarios = st.multiselect(
+        "Доступные сценарии нагружения",
+        scenario_options,
+        default=[],
+        help="Можно выбрать несколько сценариев одновременно."
+    )
+
+    st.caption("Для каждого выбранного сценария будет сформирован отдельный блок параметров и результат расчёта.")
+
+    if selected_scenarios:
+        st.subheader("Параметры выбранных сценариев")
+        for scenario in selected_scenarios:
+            with st.expander(scenario, expanded=False):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    analysis_type = st.selectbox(f"Тип расчета ({scenario[:20]}...)", ["Статический", "Температурный", "Модальный", "Спектральный"], key=f"analysis_type_{scenario}")
+                    preset = get_analysis_preset(analysis_type)
+                    st.caption(preset["description"])
+                    st.slider(f"Температура для сценария ({scenario[:20]}...)", 20, 800, preset["default_temp"], key=f"temp_{scenario}")
+                    st.selectbox(f"Тип нагрузки ({scenario[:20]}...)", ["Гравитация", "Сейсмика", "Комбинированная"], index=["Гравитация", "Сейсмика", "Комбинированная"].index(preset["default_load_type"]), key=f"load_type_{scenario}")
+                    st.selectbox(f"Направление нагрузки ({scenario[:20]}...)", ["+X", "-X", "+Y", "-Y", "+Z", "-Z"], index=["+X", "-X", "+Y", "-Y", "+Z", "-Z"].index(preset["default_direction"]), key=f"direction_{scenario}")
+                with col_b:
+                    st.slider(f"Массовый коэффициент ({scenario[:20]}...)", 0.5, 2.0, 1.0, 0.1, key=f"mass_factor_{scenario}")
+                    st.checkbox(f"Учитывать собственный вес ({scenario[:20]}...)", value=True, key=f"gravity_{scenario}")
+
+    if st.button("Сформировать набор сценариев", type="primary"):
+        st.session_state['selected_scenarios'] = selected_scenarios
+        st.session_state['exp_done'] = bool(selected_scenarios)
+        st.session_state['test_done'] = bool(selected_scenarios)
+
+        if selected_scenarios:
+            first_scenario = selected_scenarios[0]
+            base_magnitude = 50.0 + 5.0 * min(len(selected_scenarios), 3)
+            st.session_state['exp_load'] = {
+                "location": "Центральная зона",
+                "direction": "+Z",
+                "magnitude": base_magnitude,
+                "region_mode": "Автоматическая зона",
+                "selection_points": st.session_state.get('selected_region_points', []),
+                "scenario": first_scenario,
+            }
+            if len(selected_scenarios) > 1:
+                second_scenario = selected_scenarios[1]
+                st.session_state['test_load'] = {
+                    "location": "Боковая поверхность",
+                    "direction": "+X",
+                    "magnitude": base_magnitude + 20.0,
+                    "region_mode": "Автоматическая зона",
+                    "selection_points": st.session_state.get('selected_region_points', []),
+                    "scenario": second_scenario,
+                }
+            else:
+                st.session_state['test_load'] = st.session_state['exp_load']
+
+        st.success(f"Сформировано {len(selected_scenarios)} сценариев нагружения.")

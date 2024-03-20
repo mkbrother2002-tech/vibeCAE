@@ -783,3 +783,165 @@ with tab2:
                 st.session_state['test_load'] = st.session_state['exp_load']
 
         st.success(f"Сформировано {len(selected_scenarios)} сценариев нагружения.")
+
+# --- ВКЛАДКА 3: АНАЛИЗ НДС И ОТЧЕТ ---
+with tab3:
+    st.header("Инженерный вердикт и отчетность для НТС")
+
+    selected_scenarios = st.session_state.get('selected_scenarios', [])
+    mesh = st.session_state.get('active_mesh') or st.session_state.get('stl_mesh')
+
+    if not selected_scenarios:
+        st.warning("⚠️ Выберите хотя бы один сценарий нагружения на вкладке 2, чтобы видеть результаты по нагрузкам.")
+    elif mesh is None:
+        st.warning("⚠️ Сначала загрузите и обработайте модель, чтобы построить карты напряжений.")
+    else:
+        limit_strength = MATERIALS_GOST[selected_material]["yield_strength"]
+        st.caption(f"Текущий материал: {selected_material} | Предел текучести: {limit_strength} МПа")
+        st.info("💡 Здесь отображаются результаты именно по тем сценариям, которые выбраны на вкладке 2. Для каждого сценария показывается своя нагрузка, температура и карта напряжений.")
+
+        coords = mesh.vertices[:, :3]
+        scenario_results = []
+
+        for scenario in selected_scenarios:
+            analysis_type = st.session_state.get(f'analysis_type_{scenario}', 'Статический')
+            direction = st.session_state.get(f'direction_{scenario}', '+Z')
+            temperature = st.session_state.get(f'temp_{scenario}', 20)
+            load_type = st.session_state.get(f'load_type_{scenario}', 'Гравитация')
+            mass_factor = st.session_state.get(f'mass_factor_{scenario}', 1.0)
+            include_gravity = st.session_state.get(f'gravity_{scenario}', True)
+            preset = get_analysis_preset(analysis_type)
+
+            magnitude = 40.0 * preset["magnitude_scale"] + 10.0 * float(mass_factor) + (15.0 if load_type == 'Сейсмика' else 0.0) + (10.0 if include_gravity else 0.0)
+            load_params = {
+                "location": "Центральная зона",
+                "direction": direction,
+                "magnitude": magnitude,
+                "temperature": temperature,
+                "load_type": load_type,
+                "mass_factor": mass_factor,
+                "gravity": include_gravity,
+                "scenario": scenario,
+                "region_mode": "Автоматическая зона",
+                "selection_points": st.session_state.get('selected_region_points', []),
+            }
+            stress = build_load_stress_field(mesh, load_params, base_stress=preset["base_stress"] + 0.5 * temperature, max_stress=preset["max_stress"] + 10.0 * temperature)
+            max_stress_val = float(np.max(stress)) if stress is not None else 0.0
+            scenario_results.append((scenario, load_params, stress, max_stress_val))
+
+        if not scenario_results:
+            st.info("Сценарии ещё не сформированы. Вернитесь на вкладку 2 и нажмите кнопку формирования.")
+        else:
+            color_max = max(value for _, _, _, value in scenario_results) if scenario_results else 1.0
+            color_max = color_max * 1.05 if color_max > 0 else 1.0
+
+            st.subheader("Сравнение сценариев")
+            comparison_rows = []
+            for scenario, load_params, stress, max_stress_val in scenario_results:
+                safety_factor = limit_strength / max_stress_val if max_stress_val > 0 else float("inf")
+                comparison_rows.append({
+                    "Сценарий": scenario,
+                    "Тип расчета": st.session_state.get(f'analysis_type_{scenario}', 'Статический'),
+                    "Температура, °C": load_params['temperature'],
+                    "Направление": load_params['direction'],
+                    "Макс. напряжение, МПа": round(max_stress_val, 2),
+                    "Запас прочности": round(safety_factor, 2) if np.isfinite(safety_factor) else "∞",
+                    "Вердикт": "Пройдён" if safety_factor >= 1.3 else "Требует уточнения"
+                })
+            if comparison_rows:
+                st.dataframe(comparison_rows, use_container_width=True, hide_index=True)
+
+            for scenario, load_params, stress, max_stress_val in scenario_results:
+                with st.expander(scenario, expanded=True):
+                    col_info, col_plot = st.columns([1, 2])
+                    with col_info:
+                        st.metric("Макс. напряжение", f"{max_stress_val:.1f} МПа")
+                        st.caption(f"Температура: {load_params['temperature']} °C | Тип: {load_params['load_type']} | Направление: {load_params['direction']}")
+                        st.caption(f"Массовый коэффициент: {load_params['mass_factor']:.1f} | Учитывать собственный вес: {'да' if load_params['gravity'] else 'нет'}")
+                        safety_factor = limit_strength / max_stress_val if max_stress_val > 0 else float("inf")
+                        safety_text = f"{safety_factor:.3f}" if safety_factor < 1.0 else f"{safety_factor:.2f}"
+                        status_text = "Пройдён" if safety_factor >= 1.3 else "Требует уточнения"
+                        status_color = "normal" if safety_factor >= 1.3 else "inverse"
+                        st.metric("Запас прочности", safety_text, delta=status_text, delta_color=status_color)
+
+                        if load_params['temperature'] > 300:
+                            temp_note = "Высокая температура — нужен дополнительный термоупругий контроль"
+                        elif load_params['temperature'] > 100:
+                            temp_note = "Повышенная температура — стоит проверить свойства материала"
+                        else:
+                            temp_note = "Температурный уровень в допустимом диапазоне"
+
+                        st.caption(temp_note)
+                        st.caption("Что проверить дальше:")
+                        analysis_type = st.session_state.get(f'analysis_type_{scenario}', 'Статический')
+                        for rec in get_engineering_recommendations(analysis_type, max_stress_val, safety_factor, load_params['temperature'], load_params['direction'], load_params['load_type']):
+                            st.caption(f"• {rec}")
+
+                        if safety_factor < 1.0:
+                            st.error("Критический уровень напряжений: требуется пересмотр конструкции или нагрузки.")
+                        elif safety_factor < 1.3:
+                            st.warning("Напряжения близки к предельным: целесообразно уточнить параметры.")
+                        else:
+                            st.success("Сценарий выглядит допустимым по текущей грубой оценке.")
+
+                    with col_plot:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter3d(
+                            x=coords[:, 0],
+                            y=coords[:, 1],
+                            z=coords[:, 2],
+                            mode='markers',
+                            marker=dict(size=3, color=stress, colorscale='Jet', cmin=0, cmax=color_max, showscale=True)
+                        ))
+                        fig.update_layout(
+                            title=f"Эпюра НДС по сценарию: {scenario}",
+                            scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
+                            height=430,
+                            margin=dict(l=0, r=0, b=0, t=40),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            if REPORTLAB_AVAILABLE:
+                report_rows = []
+                worst_case = None
+                for scenario, load_params, _, max_stress_val in scenario_results:
+                    analysis_type = st.session_state.get(f'analysis_type_{scenario}', 'Статический')
+                    safety_factor = limit_strength / max_stress_val if max_stress_val > 0 else float("inf")
+                    row = {
+                        "scenario": scenario,
+                        "analysis_type": analysis_type,
+                        "temperature": load_params['temperature'],
+                        "direction": load_params['direction'],
+                        "max_stress": max_stress_val,
+                        "safety_factor": safety_factor,
+                        "verdict": "Пройдён" if safety_factor >= 1.3 else "Требует уточнения",
+                    }
+                    report_rows.append(row)
+
+                    if worst_case is None or row["safety_factor"] < worst_case["row"]["safety_factor"]:
+                        worst_case = {
+                            "row": row,
+                            "scenario": scenario,
+                        }
+
+                preview_png = None
+                if worst_case is not None:
+                    for scenario, _, stress, _ in scenario_results:
+                        if scenario == worst_case["scenario"]:
+                            preview_png = build_nds_preview_png(coords, stress, scenario)
+                            break
+
+                pdf_data = build_pdf_report_bytes(selected_material, report_rows, preview_png=preview_png)
+                if pdf_data is not None:
+                    st.download_button(
+                        "Скачать реальный PDF-отчет",
+                        data=pdf_data,
+                        file_name="vibecae_report.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning("Не удалось сформировать PDF-отчет.")
+            else:
+                st.info("ReportLab недоступен. Установите reportlab для возможности экспорта PDF-отчётов.")

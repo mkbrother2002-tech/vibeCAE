@@ -4,6 +4,8 @@ import numpy as np
 import plotly.graph_objects as go
 import trimesh
 from io import BytesIO
+import cadquery as cq
+from OCP import TopoDS
 
 # Настройка страницы
 st.set_page_config(page_title="VibeCAE - Атоммаш & ЦИФРА", layout="wide")
@@ -33,6 +35,100 @@ def _safe_max_stress(*arrays):
         except Exception:
             continue
     return max(values) if values else 0.0
+
+
+def load_step_to_trimesh(file_bytes):
+    try:
+        step_path = "/tmp/vibecae_step.step"
+        with open(step_path, "wb") as fh:
+            fh.write(file_bytes)
+
+        shape = cq.importers.importStep(step_path)
+        if shape is None:
+            return None
+
+        if hasattr(shape, "Solids"):
+            solid = shape.Solids().val()
+        else:
+            solid = shape
+
+        if solid is None:
+            return None
+
+        from OCP.STEPControl import STEPControl_Reader
+        from OCP.IFSelect import IFSelect_RetDone
+        from OCP import TopoDS
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.BRep import BRep_Tool
+        from OCP.gp import gp_Pnt
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopLoc import TopLoc_Location
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.GeomAbs import GeomAbs_Plane
+
+        reader = STEPControl_Reader()
+        status = reader.ReadFile(step_path)
+        if status != IFSelect_RetDone:
+            return None
+
+        reader.TransferRoot(1)
+        shape = reader.Shape(1)
+
+        if not shape.IsNull():
+            from OCP.TopoDS import TopoDS_Shape
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.BRepTools import BRepTools
+            from OCP.BRep import BRep_Tool
+            from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.gp import gp_Pnt
+            import numpy as np
+
+            explorer = TopExp_Explorer(shape, TopAbs_FACE)
+            faces = []
+            while explorer.More():
+                face = explorer.Current()
+                faces.append(face)
+                explorer.Next()
+
+            if not faces:
+                return None
+
+            verts = []
+            faces_idx = []
+            current_offset = 0
+            for face in faces:
+                try:
+                    mesh = BRepMesh_IncrementalMesh(face, 0.5)
+                    mesh.Perform()
+                    triangulation = BRep_Tool.Triangulation(face, TopLoc_Location())
+                    if triangulation is None:
+                        continue
+                    for i in range(1, triangulation.NbNodes() + 1):
+                        pnt = triangulation.Node(i).Transformed(TopLoc_Location())
+                        verts.append((pnt.X(), pnt.Y(), pnt.Z()))
+                    for i in range(1, triangulation.NbTriangles() + 1):
+                        tri = triangulation.Triangle(i)
+                        n1 = tri.Get(1) - 1
+                        n2 = tri.Get(2) - 1
+                        n3 = tri.Get(3) - 1
+                        faces_idx.append((current_offset + n1, current_offset + n2, current_offset + n3))
+                    current_offset += triangulation.NbNodes()
+                except Exception:
+                    continue
+
+            if not verts:
+                return None
+
+            return trimesh.Trimesh(vertices=np.array(verts), faces=np.array(faces_idx), process=False)
+
+        return None
+    except Exception as e:
+        st.warning(f"Не удалось прочитать STEP: {e}")
+        return None
 
 
 def build_mesh_from_uploaded_model(mesh, element_size_mm):
@@ -141,11 +237,17 @@ def get_load_center(mesh, location):
 
     coords = mesh.vertices[:, :3]
     if location == "Верхняя поверхность":
-        return coords[np.argmax(coords[:, 2])]
+        z_max = np.max(coords[:, 2])
+        subset = coords[np.isclose(coords[:, 2], z_max, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else coords.mean(axis=0)
     if location == "Нижняя поверхность":
-        return coords[np.argmin(coords[:, 2])]
+        z_min = np.min(coords[:, 2])
+        subset = coords[np.isclose(coords[:, 2], z_min, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else coords.mean(axis=0)
     if location == "Боковая поверхность":
-        return coords[np.argmax(np.abs(coords[:, 0]))]
+        x_abs_max = np.max(np.abs(coords[:, 0]))
+        subset = coords[np.isclose(np.abs(coords[:, 0]), x_abs_max, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else coords.mean(axis=0)
     return coords.mean(axis=0)
 
 
@@ -176,7 +278,7 @@ def build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=600
 
     projection = np.einsum('ij,j->i', delta, direction)
     projection = np.clip(projection / max(size_scale, 1e-3), -1.0, 1.0)
-    direction_factor = 1.0 + 0.6 * np.maximum(projection, 0.0)
+    direction_factor = 1.0 + 0.9 * projection
 
     magnitude = float(load_params.get("magnitude", 1.0))
     stress = base_stress + magnitude * 18.0 * influence * direction_factor
@@ -202,6 +304,8 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 if 'mesh_built' not in st.session_state:
     st.session_state['mesh_built'] = False
+if 'mesh_build_key' not in st.session_state:
+    st.session_state['mesh_build_key'] = None
 if 'exp_done' not in st.session_state:
     st.session_state['exp_done'] = False
 if 'test_done' not in st.session_state:
@@ -219,10 +323,10 @@ if 'exp_load' not in st.session_state:
 if 'test_load' not in st.session_state:
     st.session_state['test_load'] = None
 
-# --- ВКЛАДКА 1: ИМПОРТ И ФИКСИРОВАННАЯ КНОПКА ЗАГРУЗКИ ---
+# --- ВКЛАДКА 1: ИМПОРТ И АВТОМАТИЧЕСКОЕ ПОСТРОЕНИЕ СЕТКИ ---
 with tab1:
     st.header("Подготовка конечно-элементной модели (КЭМ)")
-    st.write("Загрузите STL-модель и постройте на ней сетку прямо на основе загруженной геометрии.")
+    st.write("Загрузите STL-модель, и сетка будет строиться автоматически прямо на основе загруженной геометрии.")
     
     uploaded_file = st.file_uploader(
         "Загрузить CAD-модель геометрии изделия (.stp, .step, .stl, .parasolid)", 
@@ -231,20 +335,42 @@ with tab1:
     )
     
     if uploaded_file:
-        st.info(f"Файл `{uploaded_file.name}` успешно загружен в буфер симулятора. Для построения сетки нажмите кнопку ниже.")
+        st.info(f"Файл `{uploaded_file.name}` успешно загружен в буфер симулятора. Сетка строится автоматически.")
 
-        if uploaded_file.name.lower().endswith('.stl'):
+        if st.session_state.get('stl_name') != uploaded_file.name:
             try:
-                mesh_bytes = uploaded_file.getvalue()
-                mesh = trimesh.load(BytesIO(mesh_bytes), file_type='stl', force='mesh')
-                if isinstance(mesh, trimesh.Scene):
-                    mesh = mesh.dump(concatenate=True)
-                st.session_state['stl_mesh'] = mesh
-                st.session_state['stl_name'] = uploaded_file.name
-                st.session_state['active_mesh'] = mesh
-                st.success("STL-файл прочитан. Ниже показана его треугольная поверхность.")
+                if uploaded_file.name.lower().endswith('.stl'):
+                    mesh_bytes = uploaded_file.getvalue()
+                    mesh = trimesh.load(BytesIO(mesh_bytes), file_type='stl', force='mesh')
+                    if isinstance(mesh, trimesh.Scene):
+                        mesh = mesh.dump(concatenate=True)
+                    st.session_state['stl_mesh'] = mesh
+                    st.session_state['stl_name'] = uploaded_file.name
+                    st.session_state['active_mesh'] = mesh
+                    st.session_state['mesh_build_key'] = None
+                    st.success("STL-файл прочитан. Сетка будет построена автоматически.")
+                elif uploaded_file.name.lower().endswith(('.step', '.stp')):
+                    mesh = load_step_to_trimesh(uploaded_file.getvalue())
+                    if mesh is not None:
+                        st.session_state['stl_mesh'] = mesh
+                        st.session_state['stl_name'] = uploaded_file.name
+                        st.session_state['active_mesh'] = mesh
+                        st.session_state['mesh_build_key'] = None
+                        st.success("STEP-файл прочитан. Сетка будет построена автоматически.")
+                    else:
+                        st.warning("STEP-файл не удалось обработать. Проверьте геометрию файла или попробуйте STL-экспорт.")
+                        st.session_state['stl_mesh'] = None
+                        st.session_state['stl_name'] = uploaded_file.name
+                        st.session_state['active_mesh'] = None
+                        st.session_state['mesh_build_key'] = None
+                else:
+                    st.warning("Для текущей версии приложения автоматическое построение сетки поддерживается для STL и STEP.")
+                    st.session_state['stl_mesh'] = None
+                    st.session_state['stl_name'] = uploaded_file.name
+                    st.session_state['active_mesh'] = None
+                    st.session_state['mesh_build_key'] = None
             except Exception as e:
-                st.error(f"Не удалось прочитать STL: {e}")
+                st.error(f"Не удалось прочитать модель: {e}")
 
     col_mesh1, col_mesh2 = st.columns([1, 2])
     with col_mesh1:
@@ -255,22 +381,17 @@ with tab1:
         
         if st.session_state['stl_mesh'] is None:
             st.info("Сначала загрузите STL-модель.")
-        elif element_size != st.session_state['mesh_element_size']:
-            with st.spinner("Обновление сетки на модели..."):
-                st.session_state['active_mesh'] = build_mesh_from_uploaded_model(st.session_state['stl_mesh'], element_size)
-                st.session_state['mesh_built'] = True
-                st.session_state['mesh_element_size'] = element_size
-        
-        st.write(" ")
-        if st.button("Инициализировать разбиение на элементы", use_container_width=True):
-            if st.session_state['stl_mesh'] is None:
-                st.warning("Сначала загрузите STL-модель.")
-            else:
+        else:
+            mesh_key = (st.session_state['stl_name'], round(element_size, 2), mesh_type)
+            if st.session_state.get('mesh_build_key') != mesh_key:
                 with st.spinner("Построение сетки на загруженной модели..."):
                     st.session_state['active_mesh'] = build_mesh_from_uploaded_model(st.session_state['stl_mesh'], element_size)
                     st.session_state['mesh_built'] = True
                     st.session_state['mesh_element_size'] = element_size
-                st.success(f"Сетка построена на модели {st.session_state['stl_name']}!")
+                    st.session_state['mesh_build_key'] = mesh_key
+                st.success(f"Сетка построена автоматически на модели {st.session_state['stl_name']}.")
+            else:
+                st.caption("Сетка уже построена для текущих параметров.")
             
     with col_mesh2:
         if st.session_state['stl_mesh'] is not None:

@@ -421,7 +421,7 @@ with st.sidebar:
 
 # Вкладки интерфейса
 tab1, tab2, tab3 = st.tabs([
-    "1. Импорт CAD & КЭМ", 
+    "1. Импорт CAD и КЭМ", 
     "2. Сценарии нагружения", 
     "3. Анализ НДС & Отчет"
 ])
@@ -451,17 +451,18 @@ if 'selected_region_points' not in st.session_state:
 
 # --- ВКЛАДКА 1: ИМПОРТ И АВТОМАТИЧЕСКОЕ ПОСТРОЕНИЕ СЕТКИ ---
 with tab1:
-    st.header("Подготовка конечно-элементной модели (КЭМ)")
-    st.write("Загрузите STL-модель, и сетка будет строиться автоматически прямо на основе загруженной геометрии.")
+    st.header("Подготовка конечно-элементной модели")
+    st.write("Загрузите CAD-модель или STL-файл, и сетка будет строиться автоматически на основе загруженной геометрии.")
     
     uploaded_file = st.file_uploader(
-        "Загрузить CAD-модель геометрии изделия (.stp, .step, .stl, .parasolid)", 
+        "Перетащите CAD-модель сюда или выберите файл (.stp, .step, .stl, .parasolid)", 
         type=["stp", "step", "stl", "x_t"],
         key="permanent_cad_uploader"
     )
+    st.caption("Если удобнее, нажмите кнопку выбора файла или просто перетащите модель в область загрузки.")
     
     if uploaded_file:
-        st.info(f"Файл `{uploaded_file.name}` успешно загружен в буфер симулятора. Сетка строится автоматически.")
+        st.info(f"Файл `{uploaded_file.name}` успешно загружен. Сетка будет построена автоматически.")
 
         if st.session_state.get('stl_name') != uploaded_file.name:
             try:
@@ -484,29 +485,29 @@ with tab1:
                         st.session_state['mesh_build_key'] = None
                         st.success("STEP-файл прочитан. Сетка будет построена автоматически.")
                     else:
-                        st.warning("STEP-файл не удалось обработать. Проверьте геометрию файла или попробуйте STL-экспорт.")
+                        st.warning("Не удалось обработать STEP-файл. Проверьте геометрию файла или попробуйте экспорт в STL.")
                         st.session_state['stl_mesh'] = None
                         st.session_state['stl_name'] = uploaded_file.name
                         st.session_state['active_mesh'] = None
                         st.session_state['mesh_build_key'] = None
                 else:
-                    st.warning("Для текущей версии приложения автоматическое построение сетки поддерживается для STL и STEP.")
+                    st.warning("В текущей версии приложения автоматическое построение сетки поддерживается для STL и STEP.")
                     st.session_state['stl_mesh'] = None
                     st.session_state['stl_name'] = uploaded_file.name
                     st.session_state['active_mesh'] = None
                     st.session_state['mesh_build_key'] = None
             except Exception as e:
-                st.error(f"Не удалось прочитать модель: {e}")
+                st.error(f"Не удалось загрузить модель: {e}")
 
     col_mesh1, col_mesh2 = st.columns([1, 2])
     with col_mesh1:
-        st.subheader("Параметры элементов SOLID")
+        st.subheader("Параметры конечных элементов")
         element_size = st.slider("Размер ячейки/разбиения (мм)", 0.5, 10.0, st.session_state['mesh_element_size'], 0.5)
         mesh_type = st.radio("Тип конечных элементов", ["SOLID186 (3D 20-узловые гексаэдры)", "SOLID185 (Линейные блоки)"])
         st.caption("Меньшее значение — более мелкая сетка, большее — более крупная.")
         
         if st.session_state['stl_mesh'] is None:
-            st.info("Сначала загрузите STL-модель.")
+            st.info("Сначала загрузите CAD-модель или STL-файл.")
         else:
             mesh_key = (st.session_state['stl_name'], round(element_size, 2), mesh_type)
             if st.session_state.get('mesh_build_key') != mesh_key:
@@ -545,14 +546,14 @@ with tab1:
                 if len(vertex_coords) > 0:
                     center_point = vertex_coords[np.argmin(np.linalg.norm(vertex_coords - vertex_coords.mean(axis=0), axis=1))]
                     st.session_state['selected_region_points'] = [center_point.tolist()]
-                    st.success("Выделена центральная точка модели. Это будет использовано как область приложения силы.")
+                    st.success("Выделена центральная точка модели. Она будет использоваться как область приложения силы.")
                 else:
                     st.warning("Нет доступных вершин для выделения.")
             if st.button("Очистить выделение", key="clear_region_selection"):
                 st.session_state['selected_region_points'] = []
                 st.rerun()
         else:
-            st.info("Загрузите STL-файл, чтобы увидеть геометрию и построить на ней сетку.")
+            st.info("Загрузите CAD-модель или STL-файл, чтобы увидеть геометрию и построить на ней сетку.")
 
 # --- ВКЛАДКА 2: СЦЕНАРИИ НАГРУЖЕНИЯ ---
 with tab2:
@@ -576,6 +577,7 @@ with tab2:
         "Доступные сценарии нагружения",
         scenario_options,
         default=[],
+        placeholder="Выберите сценарии",
         help="Можно выбрать несколько сценариев одновременно."
     )
 

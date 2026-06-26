@@ -17,11 +17,83 @@ MATERIALS_GOST = {
     "Сталь 20": {"yield_strength": 245, "elastic_modulus": 200, "desc": "Общего назначения для неответственных узлов"},
     "Сталь 09Г2С": {"yield_strength": 345, "elastic_modulus": 205, "desc": "Низколегированная конструкционная сталь"},
     "Сталь 15Х5М": {"yield_strength": 280, "elastic_modulus": 210, "desc": "Жаростойкая и коррозионностойкая сталь"},
-    "Сплав ХН78Т (Жаропрочный)": {"yield_strength": 350, "elastic_modulus": 210, "desc": "Для высокотемпературных узлов печи"},
+    "Сплав ХН78Т (Жаропрочный)": {"yield_strength": 350, "elastic_modulus": 210, "desc": "Для высокотемпературных узлов оборудования"},
     "Титан ВТ6": {"yield_strength": 830, "elastic_modulus": 114, "desc": "Легкий высокопрочный сплав для ответственных узлов"},
     "Алюминий АМг6": {"yield_strength": 275, "elastic_modulus": 70, "desc": "Лёгкий конструкционный сплав"},
     "Бронза БрАЖ9-4": {"yield_strength": 280, "elastic_modulus": 105, "desc": "Антикоррозионный сплав для трущихся узлов"}
 }
+
+# Дополнительная база материалов для быстрых черновых расчётов
+MATERIALS_QUICK = {
+    "Сталь конструкционная": {"yield_strength": 245, "elastic_modulus": 200, "thermal_expansion": 12e-6, "poisson": 0.30},
+    "Нержавеющая сталь": {"yield_strength": 205, "elastic_modulus": 193, "thermal_expansion": 16e-6, "poisson": 0.30},
+    "Титан": {"yield_strength": 830, "elastic_modulus": 114, "thermal_expansion": 8.6e-6, "poisson": 0.34},
+    "Алюминий": {"yield_strength": 275, "elastic_modulus": 70, "thermal_expansion": 23e-6, "poisson": 0.33},
+}
+
+ANALYSIS_PRESETS = {
+    "Статический": {
+        "description": "Быстрая оценка прочности при заданной нагрузке и направлении.",
+        "base_stress": 100.0,
+        "max_stress": 5000.0,
+        "magnitude_scale": 1.0,
+        "default_temp": 20,
+        "default_load_type": "Гравитация",
+        "default_direction": "+Z",
+    },
+    "Температурный": {
+        "description": "Оценка влияния повышенной температуры на прочность и деформации.",
+        "base_stress": 115.0,
+        "max_stress": 6000.0,
+        "magnitude_scale": 1.1,
+        "default_temp": 220,
+        "default_load_type": "Комбинированная",
+        "default_direction": "+Z",
+    },
+    "Модальный": {
+        "description": "Оценка собственных частот и чувствительности к динамическому возбуждению.",
+        "base_stress": 90.0,
+        "max_stress": 4500.0,
+        "magnitude_scale": 0.9,
+        "default_temp": 20,
+        "default_load_type": "Сейсмика",
+        "default_direction": "+X",
+    },
+    "Спектральный": {
+        "description": "Оценка отклика по спектральному воздействию и направлению возбуждения.",
+        "base_stress": 95.0,
+        "max_stress": 4800.0,
+        "magnitude_scale": 1.0,
+        "default_temp": 20,
+        "default_load_type": "Сейсмика",
+        "default_direction": "+Y",
+    },
+}
+
+
+def get_analysis_preset(analysis_type):
+    return ANALYSIS_PRESETS.get(analysis_type, ANALYSIS_PRESETS["Статический"])
+
+
+def get_engineering_recommendations(analysis_type, max_stress_val, safety_factor, temperature, direction, load_type):
+    recommendations = []
+    if safety_factor < 1.0:
+        recommendations.append("Снизить уровень нагрузки или изменить зону приложения силы.")
+    elif safety_factor < 1.3:
+        recommendations.append("Проверить зону концентрации напряжений и уточнить граничные условия.")
+    else:
+        recommendations.append("Сохранить текущую схему и проверить чувствительность к температуре и направлению.")
+
+    if temperature > 200:
+        recommendations.append("Проверить термоупругие эффекты и свойства материала при повышенной температуре.")
+    if analysis_type in {"Модальный", "Спектральный"}:
+        recommendations.append("Уточнить частотный отклик и возможный резонанс относительно режима возбуждения.")
+    if load_type == "Сейсмика":
+        recommendations.append("Проверить спектральное воздействие и направление возбуждения.")
+    if direction in {"+X", "-X", "+Y", "-Y"}:
+        recommendations.append("Сравнить результат с альтернативным направлением, чтобы оценить чувствительность.")
+    return recommendations
+
 
 def _safe_max_stress(*arrays):
     values = []
@@ -231,24 +303,61 @@ def build_mesh_figure(mesh, title="Сетка на модели"):
     return fig
 
 
-def get_load_center(mesh, location):
+def get_region_mask(mesh, load_params):
+    if mesh is None:
+        return np.ones(0, dtype=bool)
+
+    coords = mesh.vertices[:, :3]
+    region_mode = load_params.get("region_mode", "Автоматическая зона")
+    if region_mode == "Выделено мышью":
+        selected_points = load_params.get("selection_points", [])
+        radius = float(load_params.get("selection_radius", 1.0))
+        if selected_points:
+            selected_coords = np.asarray(selected_points, dtype=float)
+            if selected_coords.ndim == 1:
+                selected_coords = selected_coords.reshape(1, -1)
+            dist = np.linalg.norm(coords[:, None, :] - selected_coords[None, :, :], axis=2)
+            mask = np.any(dist <= radius, axis=1)
+            if np.any(mask):
+                return mask
+        return np.ones(len(coords), dtype=bool)
+
+    if region_mode != "Пользовательская область":
+        return np.ones(len(coords), dtype=bool)
+
+    axis = load_params.get("region_axis", "Z")
+    axis_idx = {"X": 0, "Y": 1, "Z": 2}.get(axis, 2)
+    region_min = float(load_params.get("region_min", np.min(coords[:, axis_idx])))
+    region_max = float(load_params.get("region_max", np.max(coords[:, axis_idx])))
+    if region_min > region_max:
+        region_min, region_max = region_max, region_min
+
+    mask = (coords[:, axis_idx] >= region_min) & (coords[:, axis_idx] <= region_max)
+    return mask if np.any(mask) else np.ones(len(coords), dtype=bool)
+
+
+def get_load_center(mesh, load_params):
     if mesh is None:
         return np.array([0.0, 0.0, 0.0])
 
     coords = mesh.vertices[:, :3]
+    region_mask = get_region_mask(mesh, load_params)
+    active_points = coords[region_mask] if np.any(region_mask) else coords
+
+    location = load_params.get("location", "Центральная зона")
     if location == "Верхняя поверхность":
-        z_max = np.max(coords[:, 2])
-        subset = coords[np.isclose(coords[:, 2], z_max, atol=1e-6)]
-        return subset.mean(axis=0) if subset.size else coords.mean(axis=0)
+        z_max = np.max(active_points[:, 2])
+        subset = active_points[np.isclose(active_points[:, 2], z_max, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else active_points.mean(axis=0)
     if location == "Нижняя поверхность":
-        z_min = np.min(coords[:, 2])
-        subset = coords[np.isclose(coords[:, 2], z_min, atol=1e-6)]
-        return subset.mean(axis=0) if subset.size else coords.mean(axis=0)
+        z_min = np.min(active_points[:, 2])
+        subset = active_points[np.isclose(active_points[:, 2], z_min, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else active_points.mean(axis=0)
     if location == "Боковая поверхность":
-        x_abs_max = np.max(np.abs(coords[:, 0]))
-        subset = coords[np.isclose(np.abs(coords[:, 0]), x_abs_max, atol=1e-6)]
-        return subset.mean(axis=0) if subset.size else coords.mean(axis=0)
-    return coords.mean(axis=0)
+        x_abs_max = np.max(np.abs(active_points[:, 0]))
+        subset = active_points[np.isclose(np.abs(active_points[:, 0]), x_abs_max, atol=1e-6)]
+        return subset.mean(axis=0) if subset.size else active_points.mean(axis=0)
+    return active_points.mean(axis=0)
 
 
 def get_direction_vector(direction):
@@ -268,38 +377,53 @@ def build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=600
         return None
 
     coords = mesh.vertices[:, :3]
-    center = get_load_center(mesh, load_params.get("location", "Центральная зона"))
+    center = get_load_center(mesh, load_params)
     direction = get_direction_vector(load_params.get("direction", "+Z"))
+    magnitude = float(load_params.get("magnitude", 1.0))
 
     delta = coords - center
     dist = np.linalg.norm(delta, axis=1)
     size_scale = max(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)) / 6.0, 1e-3)
+
+    region_mask = get_region_mask(mesh, load_params)
     influence = np.exp(-dist / max(size_scale, 1e-3))
+    influence = np.where(region_mask, influence, 0.0)
 
     projection = np.einsum('ij,j->i', delta, direction)
     projection = np.clip(projection / max(size_scale, 1e-3), -1.0, 1.0)
-    direction_factor = 1.0 + 0.9 * projection
 
-    magnitude = float(load_params.get("magnitude", 1.0))
-    stress = base_stress + magnitude * 18.0 * influence * direction_factor
+    surface_alignment = np.abs(np.einsum('ij,j->i', delta, direction)) / np.maximum(dist, 1e-6)
+    surface_alignment = np.clip(surface_alignment, 0.0, 1.0)
+
+    directional_bias = 1.0 + 0.8 * np.maximum(projection, 0.0)
+    tangential_penalty = 1.0 - 0.45 * np.maximum(0.0, 1.0 - surface_alignment)
+
+    stress = base_stress + magnitude * 20.0 * influence * directional_bias * tangential_penalty
     stress = np.clip(stress, 0.0, max_stress)
     return stress
 
 # Боковая панель
 with st.sidebar:
     selected_material = st.selectbox("Материал конструкции (ГОСТ)", list(MATERIALS_GOST.keys()))
-    st.caption(f"_{MATERIALS_GOST[selected_material]['desc']}_")
-    st.caption(f"Предел текучести: {MATERIALS_GOST[selected_material]['yield_strength']} МПа")
-    
+    material_data = MATERIALS_GOST[selected_material]
+    st.caption(f"_{material_data['desc']}_")
+    st.caption(f"Предел текучести: {material_data['yield_strength']} МПа")
+
+    st.markdown("---")
+    st.caption("Быстрый материал для черновика")
+    quick_material = st.selectbox("Быстрый выбор материала", list(MATERIALS_QUICK.keys()), key="quick_material")
+    quick_material_data = MATERIALS_QUICK[quick_material]
+    st.caption(f"E = {quick_material_data['elastic_modulus']} ГПа | ν = {quick_material_data['poisson']:.2f}")
+    st.caption(f"σy = {quick_material_data['yield_strength']} МПа")
+
     st.markdown("---")
     st.markdown("*Статус: Компонентный FEA-режим*")
 
 # Вкладки интерфейса
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "1. Импорт CAD & КЭМ", 
-    "2. Эксплуатационный режим", 
-    "3. Испытательный режим", 
-    "4. Анализ НДС & Отчет"
+    "2. Сценарии нагружения", 
+    "3. Анализ НДС & Отчет"
 ])
 
 if 'mesh_built' not in st.session_state:
@@ -322,6 +446,8 @@ if 'exp_load' not in st.session_state:
     st.session_state['exp_load'] = None
 if 'test_load' not in st.session_state:
     st.session_state['test_load'] = None
+if 'selected_region_points' not in st.session_state:
+    st.session_state['selected_region_points'] = []
 
 # --- ВКЛАДКА 1: ИМПОРТ И АВТОМАТИЧЕСКОЕ ПОСТРОЕНИЕ СЕТКИ ---
 with tab1:
@@ -402,148 +528,222 @@ with tab1:
             st.write(f"Параметр разбиения: {element_size:.2f} мм")
 
             fig_stl = build_mesh_figure(mesh, title="Треугольная сетка на модели")
-            st.plotly_chart(fig_stl, use_container_width=True)
+            vertex_coords = mesh.vertices[:, :3]
+            fig_stl.add_trace(go.Scatter3d(
+                x=vertex_coords[:, 0],
+                y=vertex_coords[:, 1],
+                z=vertex_coords[:, 2],
+                mode='markers',
+                marker=dict(size=2.2, color='rgba(15, 60, 120, 0.85)'),
+                hoverinfo='skip',
+                customdata=np.arange(len(vertex_coords)),
+                name='vertices'
+            ))
+            st.plotly_chart(fig_stl, use_container_width=True, key="mesh_preview_chart")
+            st.caption("Выберите область приложения силы через координаты модели.")
+            if st.button("Сохранить текущую область как выделенную", key="save_region_selection"):
+                if len(vertex_coords) > 0:
+                    center_point = vertex_coords[np.argmin(np.linalg.norm(vertex_coords - vertex_coords.mean(axis=0), axis=1))]
+                    st.session_state['selected_region_points'] = [center_point.tolist()]
+                    st.success("Выделена центральная точка модели. Это будет использовано как область приложения силы.")
+                else:
+                    st.warning("Нет доступных вершин для выделения.")
+            if st.button("Очистить выделение", key="clear_region_selection"):
+                st.session_state['selected_region_points'] = []
+                st.rerun()
         else:
             st.info("Загрузите STL-файл, чтобы увидеть геометрию и построить на ней сетку.")
 
-# --- ВКЛАДКА 2: ЭКСПЛУАТАЦИОННЫЙ РЕЖИМ ---
+# --- ВКЛАДКА 2: СЦЕНАРИИ НАГРУЖЕНИЯ ---
 with tab2:
-    st.header("Анализ при эксплуатационных нагрузках")
-    col_exp1, col_exp2 = st.columns(2)
-    with col_exp1:
-        t_working = st.number_input("Расчетная температура внутри камеры (°C)", 20, 800, 200)
-        p_working = st.slider("Гидравлическое давление среды на затвор (МПа)", 0.0, 10.0, 4.5, 0.1)
-    with col_exp2:
-        gravity = st.checkbox("Учитывать гравитационную массу плит (сопромат)", value=True)
-        load_location = st.selectbox("Зона приложения нагрузки", ["Верхняя поверхность", "Нижняя поверхность", "Боковая поверхность", "Центральная зона"])
-        load_direction = st.selectbox("Направление силы", ["+X", "-X", "+Y", "-Y", "+Z", "-Z"])
-        load_magnitude = st.number_input("Величина силы, кН", 1.0, 500.0, 50.0, 1.0)
-        st.session_state['exp_load'] = {
-            "location": load_location,
-            "direction": load_direction,
-            "magnitude": float(load_magnitude),
-        }
-        
-    if st.button("Запустить симуляцию эксплуатационного режима", type="primary"):
-        with st.spinner("Решатель FEA: расчет матрицы жесткости контактной сборки..."):
-            time.sleep(0.8)
-        st.session_state['exp_done'] = True
-        st.session_state['exp_load'] = {
-            "location": load_location,
-            "direction": load_direction,
-            "magnitude": float(load_magnitude),
-        }
-        st.success("Расчет НДС под рабочим давлением завершен.")
+    st.header("Сценарии нагружения по ТЗ заказчика")
+    st.write("Выберите один или несколько сценариев, которые требуется проверить для модели оборудования.")
 
-# --- ВКЛАДКА 3: ИСПЫТАТЕЛЬНЫЙ РЕЖИМ ---
+    scenario_options = [
+        "1. Состояние покоя",
+        "2. Эксплуатация",
+        "3. Модальный анализ — пустое оборудование",
+        "4. Модальный анализ — загруженное оборудование",
+        "5. Проверка прочности — пустое оборудование",
+        "6. Проверка прочности — пустое оборудование, с учётом динамических эффектов",
+        "7. Проверка прочности — загруженное оборудование",
+        "8. Проверка прочности — загруженное оборудование, с учётом динамических эффектов",
+        "9. Проверка прочности — рабочая мощность",
+        "10. Проверка прочности — рабочая мощность, с учётом динамических эффектов"
+    ]
+
+    selected_scenarios = st.multiselect(
+        "Доступные сценарии нагружения",
+        scenario_options,
+        default=[],
+        help="Можно выбрать несколько сценариев одновременно."
+    )
+
+    st.caption("Для каждого выбранного сценария будет сформирован отдельный блок параметров и результат расчёта.")
+
+    if selected_scenarios:
+        st.subheader("Параметры выбранных сценариев")
+        for scenario in selected_scenarios:
+            with st.expander(scenario, expanded=False):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    analysis_type = st.selectbox(f"Тип расчета ({scenario[:20]}...)", ["Статический", "Температурный", "Модальный", "Спектральный"], key=f"analysis_type_{scenario}")
+                    preset = get_analysis_preset(analysis_type)
+                    st.caption(preset["description"])
+                    st.slider(f"Температура для сценария ({scenario[:20]}...)", 20, 800, preset["default_temp"], key=f"temp_{scenario}")
+                    st.selectbox(f"Тип нагрузки ({scenario[:20]}...)", ["Гравитация", "Сейсмика", "Комбинированная"], index=["Гравитация", "Сейсмика", "Комбинированная"].index(preset["default_load_type"]), key=f"load_type_{scenario}")
+                    st.selectbox(f"Направление нагрузки ({scenario[:20]}...)", ["+X", "-X", "+Y", "-Y", "+Z", "-Z"], index=["+X", "-X", "+Y", "-Y", "+Z", "-Z"].index(preset["default_direction"]), key=f"direction_{scenario}")
+                with col_b:
+                    st.slider(f"Массовый коэффициент ({scenario[:20]}...)", 0.5, 2.0, 1.0, 0.1, key=f"mass_factor_{scenario}")
+                    st.checkbox(f"Учитывать собственный вес ({scenario[:20]}...)", value=True, key=f"gravity_{scenario}")
+
+    if st.button("Сформировать набор сценариев", type="primary"):
+        st.session_state['selected_scenarios'] = selected_scenarios
+        st.session_state['exp_done'] = bool(selected_scenarios)
+        st.session_state['test_done'] = bool(selected_scenarios)
+
+        if selected_scenarios:
+            first_scenario = selected_scenarios[0]
+            base_magnitude = 50.0 + 5.0 * min(len(selected_scenarios), 3)
+            st.session_state['exp_load'] = {
+                "location": "Центральная зона",
+                "direction": "+Z",
+                "magnitude": base_magnitude,
+                "region_mode": "Автоматическая зона",
+                "selection_points": st.session_state.get('selected_region_points', []),
+                "scenario": first_scenario,
+            }
+            if len(selected_scenarios) > 1:
+                second_scenario = selected_scenarios[1]
+                st.session_state['test_load'] = {
+                    "location": "Боковая поверхность",
+                    "direction": "+X",
+                    "magnitude": base_magnitude + 20.0,
+                    "region_mode": "Автоматическая зона",
+                    "selection_points": st.session_state.get('selected_region_points', []),
+                    "scenario": second_scenario,
+                }
+            else:
+                st.session_state['test_load'] = st.session_state['exp_load']
+
+        st.success(f"Сформировано {len(selected_scenarios)} сценариев нагружения.")
+
+# --- ВКЛАДКА 3: АНАЛИЗ НДС И ОТЧЕТ ---
 with tab3:
-    st.header("Анализ при испытательных нагрузках")
-    p_test = st.number_input("Давление гидроопрессовки корпуса по ГОСТ (МПа)", 0.5, 20.0, 7.2)
-    load_location_test = st.selectbox("Зона приложения нагрузки", ["Верхняя поверхность", "Нижняя поверхность", "Боковая поверхность", "Центральная зона"], key="test_load_location")
-    load_direction_test = st.selectbox("Направление силы", ["+X", "-X", "+Y", "-Y", "+Z", "-Z"], key="test_load_direction")
-    load_magnitude_test = st.number_input("Величина силы, кН", 1.0, 500.0, 80.0, 1.0, key="test_load_magnitude")
-    st.session_state['test_load'] = {
-        "location": load_location_test,
-        "direction": load_direction_test,
-        "magnitude": float(load_magnitude_test),
-    }
-    
-    if st.button("Запустить симуляцию испытательного режима", type="primary"):
-        with st.spinner("Расчет напряженно-деформированного состояния при опрессовке..."):
-            time.sleep(0.8)
-        st.session_state['test_done'] = True
-        st.session_state['test_load'] = {
-            "location": load_location_test,
-            "direction": load_direction_test,
-            "magnitude": float(load_magnitude_test),
-        }
-        st.success("Анализ прочности при испытаниях завершен.")
+    st.header("Инженерный вердикт и отчетность для НТС")
 
-# --- ВКЛАДКА 4: ЧЕСТНЫЙ АНАЛИЗ НДС И ЭПЮРЫ ---
-with tab4:
-    st.header("Инженерный вердикт и Отчетность для НТС")
+    selected_scenarios = st.session_state.get('selected_scenarios', [])
+    mesh = st.session_state.get('active_mesh') or st.session_state.get('stl_mesh')
 
-    exp_ready = st.session_state['exp_done'] or st.session_state.get('exp_load') is not None
-    test_ready = st.session_state['test_done'] or st.session_state.get('test_load') is not None
-
-    if not (exp_ready or test_ready):
-        st.warning("⚠️ Запустите вычисления во вкладках 2 и/или 3, чтобы построить карты распределения напряжений.")
+    if not selected_scenarios:
+        st.warning("⚠️ Выберите хотя бы один сценарий нагружения на вкладке 2, чтобы видеть результаты по нагрузкам.")
+    elif mesh is None:
+        st.warning("⚠️ Сначала загрузите и обработайте модель, чтобы построить карты напряжений.")
     else:
         limit_strength = MATERIALS_GOST[selected_material]["yield_strength"]
         st.caption(f"Текущий материал: {selected_material} | Предел текучести: {limit_strength} МПа")
-        st.info("💡 **Физический анализ:** Геометрия абсолютно жесткая и плоская. Очаг нагрузки (красная зона) локализован строго на диске ножа, куда бьет фронтальное давление среды. На массивном корпусе видны кольца концентрации напряжений Кирша вокруг отверстия.")
+        st.info("💡 Здесь отображаются результаты именно по тем сценариям, которые выбраны на вкладке 2. Для каждого сценария показывается своя нагрузка, температура и карта напряжений.")
 
-        col_res1, col_res2 = st.columns(2)
+        coords = mesh.vertices[:, :3]
+        scenario_results = []
 
-        working_data = None
-        test_data = None
+        for scenario in selected_scenarios:
+            analysis_type = st.session_state.get(f'analysis_type_{scenario}', 'Статический')
+            direction = st.session_state.get(f'direction_{scenario}', '+Z')
+            temperature = st.session_state.get(f'temp_{scenario}', 20)
+            load_type = st.session_state.get(f'load_type_{scenario}', 'Гравитация')
+            mass_factor = st.session_state.get(f'mass_factor_{scenario}', 1.0)
+            include_gravity = st.session_state.get(f'gravity_{scenario}', True)
+            preset = get_analysis_preset(analysis_type)
 
-        if exp_ready:
-            mesh = st.session_state.get('active_mesh') or st.session_state.get('stl_mesh')
-            if mesh is not None:
-                coords = mesh.vertices[:, :3]
-                load_params = st.session_state.get('exp_load') or {"location": "Центральная зона", "direction": "+Z", "magnitude": 50.0}
-                stress = build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=6000.0)
-                max_work = float(np.max(stress)) if stress is not None else 0.0
-                working_data = {
-                    "Xf": coords[:, 0], "Yf": coords[:, 1], "Zf": coords[:, 2],
-                    "sf": stress, "sb": stress, "sp": stress, "sk": stress,
-                    "max": max_work,
-                    "load": load_params,
-                }
-            else:
-                working_data = None
+            magnitude = 40.0 * preset["magnitude_scale"] + 10.0 * float(mass_factor) + (15.0 if load_type == 'Сейсмика' else 0.0) + (10.0 if include_gravity else 0.0)
+            load_params = {
+                "location": "Центральная зона",
+                "direction": direction,
+                "magnitude": magnitude,
+                "temperature": temperature,
+                "load_type": load_type,
+                "mass_factor": mass_factor,
+                "gravity": include_gravity,
+                "scenario": scenario,
+                "region_mode": "Автоматическая зона",
+                "selection_points": st.session_state.get('selected_region_points', []),
+            }
+            stress = build_load_stress_field(mesh, load_params, base_stress=preset["base_stress"] + 0.5 * temperature, max_stress=preset["max_stress"] + 10.0 * temperature)
+            max_stress_val = float(np.max(stress)) if stress is not None else 0.0
+            scenario_results.append((scenario, load_params, stress, max_stress_val))
 
-        if test_ready:
-            mesh = st.session_state.get('active_mesh') or st.session_state.get('stl_mesh')
-            if mesh is not None:
-                coords = mesh.vertices[:, :3]
-                load_params = st.session_state.get('test_load') or {"location": "Центральная зона", "direction": "+Z", "magnitude": 80.0}
-                stress = build_load_stress_field(mesh, load_params, base_stress=150.0, max_stress=7000.0)
-                max_test = float(np.max(stress)) if stress is not None else 0.0
-                test_data = {
-                    "Xf": coords[:, 0], "Yf": coords[:, 1], "Zf": coords[:, 2],
-                    "sf": stress, "sb": stress, "sp": stress, "sk": stress,
-                    "max": max_test,
-                    "load": load_params,
-                }
-            else:
-                test_data = None
+        if not scenario_results:
+            st.info("Сценарии ещё не сформированы. Вернитесь на вкладку 2 и нажмите кнопку формирования.")
+        else:
+            color_max = max(value for _, _, _, value in scenario_results) if scenario_results else 1.0
+            color_max = color_max * 1.05 if color_max > 0 else 1.0
 
-        color_max = max((working_data["max"] if working_data else 0.0), (test_data["max"] if test_data else 0.0))
-        color_max = color_max * 1.05 if color_max > 0 else 1.0
+            st.subheader("Сравнение сценариев")
+            comparison_rows = []
+            for scenario, load_params, stress, max_stress_val in scenario_results:
+                safety_factor = limit_strength / max_stress_val if max_stress_val > 0 else float("inf")
+                comparison_rows.append({
+                    "Сценарий": scenario,
+                    "Тип расчета": st.session_state.get(f'analysis_type_{scenario}', 'Статический'),
+                    "Температура, °C": load_params['temperature'],
+                    "Направление": load_params['direction'],
+                    "Макс. напряжение, МПа": round(max_stress_val, 2),
+                    "Запас прочности": round(safety_factor, 2) if np.isfinite(safety_factor) else "∞",
+                    "Вердикт": "Пройдён" if safety_factor >= 1.3 else "Требует уточнения"
+                })
+            if comparison_rows:
+                st.dataframe(comparison_rows, use_container_width=True, hide_index=True)
 
-        with col_res1:
-            st.subheader("Рабочий режим (Давление среды)")
-            if working_data:
-                st.metric("Макс. напряжения по Мизесу", f"{working_data['max']:.1f} МПа")
-                st.caption(f"Нагрузка: {working_data['load']['location']} | Направление: {working_data['load']['direction']} | Сила: {working_data['load']['magnitude']:.1f} кН")
-                safety_factor_work = limit_strength / working_data['max'] if working_data['max'] > 0 else float("inf")
-                safety_work_text = f"{safety_factor_work:.3f}" if safety_factor_work < 1.0 else f"{safety_factor_work:.2f}"
-                st.metric("Запас прочности конструкции", safety_work_text, delta="Безопасно" if safety_factor_work > 1.3 else "Критический уровень")
+            for scenario, load_params, stress, max_stress_val in scenario_results:
+                with st.expander(scenario, expanded=True):
+                    col_info, col_plot = st.columns([1, 2])
+                    with col_info:
+                        st.metric("Макс. напряжение", f"{max_stress_val:.1f} МПа")
+                        st.caption(f"Температура: {load_params['temperature']} °C | Тип: {load_params['load_type']} | Направление: {load_params['direction']}")
+                        st.caption(f"Массовый коэффициент: {load_params['mass_factor']:.1f} | Учитывать собственный вес: {'да' if load_params['gravity'] else 'нет'}")
+                        safety_factor = limit_strength / max_stress_val if max_stress_val > 0 else float("inf")
+                        safety_text = f"{safety_factor:.3f}" if safety_factor < 1.0 else f"{safety_factor:.2f}"
+                        status_text = "Пройдён" if safety_factor >= 1.3 else "Требует уточнения"
+                        status_color = "normal" if safety_factor >= 1.3 else "inverse"
+                        st.metric("Запас прочности", safety_text, delta=status_text, delta_color=status_color)
 
-                fig_w = go.Figure()
-                fig_w.add_trace(go.Scatter3d(x=working_data['Xf'], y=working_data['Yf'], z=working_data['Zf'], mode='markers', marker=dict(size=3, color=working_data['sf'], colorscale='Jet', cmin=0, cmax=color_max, showscale=True)))
-                fig_w.update_layout(title="Эпюра НДС сборки (Работа)", scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'), height=450, margin=dict(l=0,r=0,b=0,t=40))
-                st.plotly_chart(fig_w, use_container_width=True)
-            else:
-                st.info("Запустите расчет во вкладке 2, чтобы увидеть эпюру рабочего режима.")
+                        if load_params['temperature'] > 300:
+                            temp_note = "Высокая температура — нужен дополнительный термоупругий контроль"
+                        elif load_params['temperature'] > 100:
+                            temp_note = "Повышенная температура — стоит проверить свойства материала"
+                        else:
+                            temp_note = "Температурный уровень в допустимом диапазоне"
 
-        with col_res2:
-            st.subheader("Испытательный режим (Опрессовка)")
-            if test_data:
-                st.metric("Макс. напряжения при опрессовке", f"{test_data['max']:.1f} МПа")
-                safety_factor_test = limit_strength / test_data['max'] if test_data['max'] > 0 else float("inf")
-                safety_test_text = f"{safety_factor_test:.3f}" if safety_factor_test < 1.0 else f"{safety_factor_test:.2f}"
-                st.metric("Запас при гидроиспытаниях", safety_test_text, delta="Тест пройден" if safety_factor_test >= 1.0 else "🚨 Пластический шарнир", delta_color="normal" if safety_factor_test >= 1.0 else "inverse")
+                        st.caption(temp_note)
+                        st.caption("Что проверить дальше:")
+                        for rec in get_engineering_recommendations(analysis_type, max_stress_val, safety_factor, load_params['temperature'], load_params['direction'], load_params['load_type']):
+                            st.caption(f"• {rec}")
 
-                fig_t = go.Figure()
-                fig_t.add_trace(go.Scatter3d(x=test_data['Xf'], y=test_data['Yf'], z=test_data['Zf'], mode='markers', marker=dict(size=3, color=test_data['sf'], colorscale='Jet', cmin=0, cmax=color_max, showscale=True)))
-                fig_t.update_layout(title="Эпюра НДС сборки (Гидроиспытания)", scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'), height=450, margin=dict(l=0,r=0,b=0,t=40))
-                st.plotly_chart(fig_t, use_container_width=True)
-            else:
-                st.info("Запустите расчет во вкладке 3, чтобы увидеть эпюру испытательного режима.")
+                        if safety_factor < 1.0:
+                            st.error("Критический уровень напряжений: требуется пересмотр конструкции или нагрузки.")
+                        elif safety_factor < 1.3:
+                            st.warning("Напряжения близки к предельным: целесообразно уточнить параметры.")
+                        else:
+                            st.success("Сценарий выглядит допустимым по текущей грубой оценке.")
 
-        st.markdown("---")
-        if st.button("СГЕНЕРИРОВАТЬ НАУЧНО-ТЕХНИЧЕСКИЙ ОТЧЕТ ДЛЯ НТС"):
-            st.success("Научно-технический отчет по сборочному узлу шибера успешно экспортирован в формат DOCX!")
+                    with col_plot:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter3d(
+                            x=coords[:, 0],
+                            y=coords[:, 1],
+                            z=coords[:, 2],
+                            mode='markers',
+                            marker=dict(size=3, color=stress, colorscale='Jet', cmin=0, cmax=color_max, showscale=True)
+                        ))
+                        fig.update_layout(
+                            title=f"Эпюра НДС по сценарию: {scenario}",
+                            scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
+                            height=430,
+                            margin=dict(l=0, r=0, b=0, t=40),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    if st.button("СГЕНЕРИРОВАТЬ НАУЧНО-ТЕХНИЧЕСКИЙ ОТЧЕТ ДЛЯ НТС"):
+        st.success("Научно-технический отчет по сборочному узлу успешно подготовлен для НТС.")

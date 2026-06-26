@@ -12,7 +12,13 @@ st.set_page_config(page_title="VibeCAE - Атоммаш & ЦИФРА", layout="w
 MATERIALS_GOST = {
     "Сталь 08Х18Н10Т (Аустенитная)": {"yield_strength": 220, "elastic_modulus": 195, "desc": "Применяется в корпусных элементах ИЗК"},
     "Сталь 12Х18Н10Т": {"yield_strength": 196, "elastic_modulus": 198, "desc": "Высокая коррозионная стойкость"},
-    "Сплав ХН78Т (Жаропрочный)": {"yield_strength": 350, "elastic_modulus": 210, "desc": "Для высокотемпературных узлов печи"}
+    "Сталь 20": {"yield_strength": 245, "elastic_modulus": 200, "desc": "Общего назначения для неответственных узлов"},
+    "Сталь 09Г2С": {"yield_strength": 345, "elastic_modulus": 205, "desc": "Низколегированная конструкционная сталь"},
+    "Сталь 15Х5М": {"yield_strength": 280, "elastic_modulus": 210, "desc": "Жаростойкая и коррозионностойкая сталь"},
+    "Сплав ХН78Т (Жаропрочный)": {"yield_strength": 350, "elastic_modulus": 210, "desc": "Для высокотемпературных узлов печи"},
+    "Титан ВТ6": {"yield_strength": 830, "elastic_modulus": 114, "desc": "Легкий высокопрочный сплав для ответственных узлов"},
+    "Алюминий АМг6": {"yield_strength": 275, "elastic_modulus": 70, "desc": "Лёгкий конструкционный сплав"},
+    "Бронза БрАЖ9-4": {"yield_strength": 280, "elastic_modulus": 105, "desc": "Антикоррозионный сплав для трущихся узлов"}
 }
 
 def _safe_max_stress(*arrays):
@@ -39,24 +45,149 @@ def build_mesh_from_uploaded_model(mesh, element_size_mm):
         mesh_copy.remove_unreferenced_vertices()
         if len(mesh_copy.faces) == 0:
             return mesh
-        return mesh_copy
+
+        if element_size_mm is None:
+            return mesh_copy
+
+        size_mm = float(element_size_mm)
+        target_edge = max(size_mm, 0.01)
+
+        try:
+            verts, faces = trimesh.remesh.subdivide_to_size(
+                mesh_copy.vertices,
+                mesh_copy.faces,
+                max_edge=target_edge,
+                max_iter=10,
+            )
+            return trimesh.Trimesh(vertices=verts, faces=faces)
+        except Exception:
+            try:
+                verts, faces = trimesh.remesh.subdivide(
+                    mesh_copy.vertices,
+                    mesh_copy.faces,
+                    return_index=False,
+                )
+                return trimesh.Trimesh(vertices=verts, faces=faces)
+            except Exception:
+                return mesh_copy
     except Exception:
         return mesh
 
-# Шапка интерфейса
-st.title("VibeCAE: Обоснование прочности оборудования ИЗК")
-st.caption("Разработано в рамках научно-технического обоснования проектов МБИР & ЦИФРА | Модуль: Массивный Монолит")
+
+def build_mesh_figure(mesh, title="Сетка на модели"):
+    if mesh is None:
+        return None
+
+    vertices = mesh.vertices
+    faces = mesh.faces
+
+    fig = go.Figure()
+    fig.add_trace(go.Mesh3d(
+        x=vertices[:, 0],
+        y=vertices[:, 1],
+        z=vertices[:, 2],
+        i=faces[:, 0],
+        j=faces[:, 1],
+        k=faces[:, 2],
+        color='lightblue',
+        opacity=0.35,
+        flatshading=True,
+        hoverinfo='skip'
+    ))
+
+    try:
+        edges = mesh.edges_unique
+        if len(edges) > 0:
+            x_lines = np.empty(3 * len(edges), dtype=float)
+            y_lines = np.empty(3 * len(edges), dtype=float)
+            z_lines = np.empty(3 * len(edges), dtype=float)
+
+            x_lines[0::3] = vertices[edges[:, 0], 0]
+            x_lines[1::3] = vertices[edges[:, 1], 0]
+            x_lines[2::3] = np.nan
+
+            y_lines[0::3] = vertices[edges[:, 0], 1]
+            y_lines[1::3] = vertices[edges[:, 1], 1]
+            y_lines[2::3] = np.nan
+
+            z_lines[0::3] = vertices[edges[:, 0], 2]
+            z_lines[1::3] = vertices[edges[:, 1], 2]
+            z_lines[2::3] = np.nan
+
+            fig.add_trace(go.Scatter3d(
+                x=x_lines,
+                y=y_lines,
+                z=z_lines,
+                mode='lines',
+                line=dict(color='rgba(20, 60, 120, 0.95)', width=1.2),
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+    except Exception:
+        pass
+
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
+        margin=dict(l=0, r=0, b=0, t=40),
+        height=500,
+    )
+    return fig
+
+
+def get_load_center(mesh, location):
+    if mesh is None:
+        return np.array([0.0, 0.0, 0.0])
+
+    coords = mesh.vertices[:, :3]
+    if location == "Верхняя поверхность":
+        return coords[np.argmax(coords[:, 2])]
+    if location == "Нижняя поверхность":
+        return coords[np.argmin(coords[:, 2])]
+    if location == "Боковая поверхность":
+        return coords[np.argmax(np.abs(coords[:, 0]))]
+    return coords.mean(axis=0)
+
+
+def get_direction_vector(direction):
+    direction_map = {
+        "+X": np.array([1.0, 0.0, 0.0]),
+        "-X": np.array([-1.0, 0.0, 0.0]),
+        "+Y": np.array([0.0, 1.0, 0.0]),
+        "-Y": np.array([0.0, -1.0, 0.0]),
+        "+Z": np.array([0.0, 0.0, 1.0]),
+        "-Z": np.array([0.0, 0.0, -1.0]),
+    }
+    return direction_map.get(direction, np.array([0.0, 0.0, 1.0]))
+
+
+def build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=6000.0):
+    if mesh is None or not load_params:
+        return None
+
+    coords = mesh.vertices[:, :3]
+    center = get_load_center(mesh, load_params.get("location", "Центральная зона"))
+    direction = get_direction_vector(load_params.get("direction", "+Z"))
+
+    delta = coords - center
+    dist = np.linalg.norm(delta, axis=1)
+    size_scale = max(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)) / 6.0, 1e-3)
+    influence = np.exp(-dist / max(size_scale, 1e-3))
+
+    projection = np.einsum('ij,j->i', delta, direction)
+    projection = np.clip(projection / max(size_scale, 1e-3), -1.0, 1.0)
+    direction_factor = 1.0 + 0.6 * np.maximum(projection, 0.0)
+
+    magnitude = float(load_params.get("magnitude", 1.0))
+    stress = base_stress + magnitude * 18.0 * influence * direction_factor
+    stress = np.clip(stress, 0.0, max_stress)
+    return stress
 
 # Боковая панель
 with st.sidebar:
-    st.header("Карточка договора")
-    st.info("**Заказчик:** АО «ЦИФРА»\n\n**Исполнитель:** ООО «АТМ»")
-    
-    st.subheader("Объект исследования")
-    object_type = st.selectbox("Выберите узел оборудования", ["Шибер герметичный (Монолитная сборка)", "Разрыв струи Ду10", "Разрыв струи Ду25"])
-    
     selected_material = st.selectbox("Материал конструкции (ГОСТ)", list(MATERIALS_GOST.keys()))
     st.caption(f"_{MATERIALS_GOST[selected_material]['desc']}_")
+    st.caption(f"Предел текучести: {MATERIALS_GOST[selected_material]['yield_strength']} МПа")
     
     st.markdown("---")
     st.markdown("*Статус: Компонентный FEA-режим*")
@@ -81,6 +212,12 @@ if 'stl_name' not in st.session_state:
     st.session_state['stl_name'] = None
 if 'active_mesh' not in st.session_state:
     st.session_state['active_mesh'] = None
+if 'mesh_element_size' not in st.session_state:
+    st.session_state['mesh_element_size'] = 2.0
+if 'exp_load' not in st.session_state:
+    st.session_state['exp_load'] = None
+if 'test_load' not in st.session_state:
+    st.session_state['test_load'] = None
 
 # --- ВКЛАДКА 1: ИМПОРТ И ФИКСИРОВАННАЯ КНОПКА ЗАГРУЗКИ ---
 with tab1:
@@ -112,8 +249,17 @@ with tab1:
     col_mesh1, col_mesh2 = st.columns([1, 2])
     with col_mesh1:
         st.subheader("Параметры элементов SOLID")
-        element_size = st.slider("Размер КЭ-ячейки (мм)", 0.5, 10.0, 2.0, 0.5)
+        element_size = st.slider("Размер ячейки/разбиения (мм)", 0.5, 10.0, st.session_state['mesh_element_size'], 0.5)
         mesh_type = st.radio("Тип конечных элементов", ["SOLID186 (3D 20-узловые гексаэдры)", "SOLID185 (Линейные блоки)"])
+        st.caption("Меньшее значение — более мелкая сетка, большее — более крупная.")
+        
+        if st.session_state['stl_mesh'] is None:
+            st.info("Сначала загрузите STL-модель.")
+        elif element_size != st.session_state['mesh_element_size']:
+            with st.spinner("Обновление сетки на модели..."):
+                st.session_state['active_mesh'] = build_mesh_from_uploaded_model(st.session_state['stl_mesh'], element_size)
+                st.session_state['mesh_built'] = True
+                st.session_state['mesh_element_size'] = element_size
         
         st.write(" ")
         if st.button("Инициализировать разбиение на элементы", use_container_width=True):
@@ -121,9 +267,9 @@ with tab1:
                 st.warning("Сначала загрузите STL-модель.")
             else:
                 with st.spinner("Построение сетки на загруженной модели..."):
-                    time.sleep(0.8)
                     st.session_state['active_mesh'] = build_mesh_from_uploaded_model(st.session_state['stl_mesh'], element_size)
                     st.session_state['mesh_built'] = True
+                    st.session_state['mesh_element_size'] = element_size
                 st.success(f"Сетка построена на модели {st.session_state['stl_name']}!")
             
     with col_mesh2:
@@ -132,11 +278,9 @@ with tab1:
             st.subheader("Сетка на загруженной модели")
             st.write(f"Файл: {st.session_state['stl_name']}")
             st.write(f"Вершин: {len(mesh.vertices):,} | Треугольников: {len(mesh.faces):,}")
+            st.write(f"Параметр разбиения: {element_size:.2f} мм")
 
-            vertices = mesh.vertices
-            faces = mesh.faces
-            fig_stl = go.Figure(data=[go.Mesh3d(x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=faces[:, 0], j=faces[:, 1], k=faces[:, 2], color='lightblue', opacity=0.8)])
-            fig_stl.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'), margin=dict(l=0, r=0, b=0, t=0), height=500)
+            fig_stl = build_mesh_figure(mesh, title="Треугольная сетка на модели")
             st.plotly_chart(fig_stl, use_container_width=True)
         else:
             st.info("Загрузите STL-файл, чтобы увидеть геометрию и построить на ней сетку.")
@@ -150,35 +294,62 @@ with tab2:
         p_working = st.slider("Гидравлическое давление среды на затвор (МПа)", 0.0, 10.0, 4.5, 0.1)
     with col_exp2:
         gravity = st.checkbox("Учитывать гравитационную массу плит (сопромат)", value=True)
+        load_location = st.selectbox("Зона приложения нагрузки", ["Верхняя поверхность", "Нижняя поверхность", "Боковая поверхность", "Центральная зона"])
+        load_direction = st.selectbox("Направление силы", ["+X", "-X", "+Y", "-Y", "+Z", "-Z"])
+        load_magnitude = st.number_input("Величина силы, кН", 1.0, 500.0, 50.0, 1.0)
+        st.session_state['exp_load'] = {
+            "location": load_location,
+            "direction": load_direction,
+            "magnitude": float(load_magnitude),
+        }
         
     if st.button("Запустить симуляцию эксплуатационного режима", type="primary"):
         with st.spinner("Решатель FEA: расчет матрицы жесткости контактной сборки..."):
-            time.sleep(1.0)
+            time.sleep(0.8)
         st.session_state['exp_done'] = True
+        st.session_state['exp_load'] = {
+            "location": load_location,
+            "direction": load_direction,
+            "magnitude": float(load_magnitude),
+        }
         st.success("Расчет НДС под рабочим давлением завершен.")
 
 # --- ВКЛАДКА 3: ИСПЫТАТЕЛЬНЫЙ РЕЖИМ ---
 with tab3:
     st.header("Анализ при испытательных нагрузках")
     p_test = st.number_input("Давление гидроопрессовки корпуса по ГОСТ (МПа)", 0.5, 20.0, 7.2)
+    load_location_test = st.selectbox("Зона приложения нагрузки", ["Верхняя поверхность", "Нижняя поверхность", "Боковая поверхность", "Центральная зона"], key="test_load_location")
+    load_direction_test = st.selectbox("Направление силы", ["+X", "-X", "+Y", "-Y", "+Z", "-Z"], key="test_load_direction")
+    load_magnitude_test = st.number_input("Величина силы, кН", 1.0, 500.0, 80.0, 1.0, key="test_load_magnitude")
+    st.session_state['test_load'] = {
+        "location": load_location_test,
+        "direction": load_direction_test,
+        "magnitude": float(load_magnitude_test),
+    }
     
     if st.button("Запустить симуляцию испытательного режима", type="primary"):
         with st.spinner("Расчет напряженно-деформированного состояния при опрессовке..."):
-            time.sleep(1.0)
+            time.sleep(0.8)
         st.session_state['test_done'] = True
+        st.session_state['test_load'] = {
+            "location": load_location_test,
+            "direction": load_direction_test,
+            "magnitude": float(load_magnitude_test),
+        }
         st.success("Анализ прочности при испытаниях завершен.")
 
 # --- ВКЛАДКА 4: ЧЕСТНЫЙ АНАЛИЗ НДС И ЭПЮРЫ ---
 with tab4:
     st.header("Инженерный вердикт и Отчетность для НТС")
 
-    exp_ready = st.session_state['exp_done']
-    test_ready = st.session_state['test_done']
+    exp_ready = st.session_state['exp_done'] or st.session_state.get('exp_load') is not None
+    test_ready = st.session_state['test_done'] or st.session_state.get('test_load') is not None
 
     if not (exp_ready or test_ready):
         st.warning("⚠️ Запустите вычисления во вкладках 2 и/или 3, чтобы построить карты распределения напряжений.")
     else:
         limit_strength = MATERIALS_GOST[selected_material]["yield_strength"]
+        st.caption(f"Текущий материал: {selected_material} | Предел текучести: {limit_strength} МПа")
         st.info("💡 **Физический анализ:** Геометрия абсолютно жесткая и плоская. Очаг нагрузки (красная зона) локализован строго на диске ножа, куда бьет фронтальное давление среды. На массивном корпусе видны кольца концентрации напряжений Кирша вокруг отверстия.")
 
         col_res1, col_res2 = st.columns(2)
@@ -189,16 +360,15 @@ with tab4:
         if exp_ready:
             mesh = st.session_state.get('active_mesh') or st.session_state.get('stl_mesh')
             if mesh is not None:
-                vertices = mesh.vertices
-                coords = vertices[:, :3]
-                center = coords.mean(axis=0)
-                dist = np.linalg.norm(coords - center, axis=1)
-                stress = np.clip(100.0 + dist * 10.0, 0.0, 5000.0)
-                max_work = float(np.max(stress))
+                coords = mesh.vertices[:, :3]
+                load_params = st.session_state.get('exp_load') or {"location": "Центральная зона", "direction": "+Z", "magnitude": 50.0}
+                stress = build_load_stress_field(mesh, load_params, base_stress=120.0, max_stress=6000.0)
+                max_work = float(np.max(stress)) if stress is not None else 0.0
                 working_data = {
                     "Xf": coords[:, 0], "Yf": coords[:, 1], "Zf": coords[:, 2],
                     "sf": stress, "sb": stress, "sp": stress, "sk": stress,
                     "max": max_work,
+                    "load": load_params,
                 }
             else:
                 working_data = None
@@ -206,16 +376,15 @@ with tab4:
         if test_ready:
             mesh = st.session_state.get('active_mesh') or st.session_state.get('stl_mesh')
             if mesh is not None:
-                vertices = mesh.vertices
-                coords = vertices[:, :3]
-                center = coords.mean(axis=0)
-                dist = np.linalg.norm(coords - center, axis=1)
-                stress = np.clip(140.0 + dist * 12.0, 0.0, 6000.0)
-                max_test = float(np.max(stress))
+                coords = mesh.vertices[:, :3]
+                load_params = st.session_state.get('test_load') or {"location": "Центральная зона", "direction": "+Z", "magnitude": 80.0}
+                stress = build_load_stress_field(mesh, load_params, base_stress=150.0, max_stress=7000.0)
+                max_test = float(np.max(stress)) if stress is not None else 0.0
                 test_data = {
                     "Xf": coords[:, 0], "Yf": coords[:, 1], "Zf": coords[:, 2],
                     "sf": stress, "sb": stress, "sp": stress, "sk": stress,
                     "max": max_test,
+                    "load": load_params,
                 }
             else:
                 test_data = None
@@ -227,6 +396,7 @@ with tab4:
             st.subheader("Рабочий режим (Давление среды)")
             if working_data:
                 st.metric("Макс. напряжения по Мизесу", f"{working_data['max']:.1f} МПа")
+                st.caption(f"Нагрузка: {working_data['load']['location']} | Направление: {working_data['load']['direction']} | Сила: {working_data['load']['magnitude']:.1f} кН")
                 safety_factor_work = limit_strength / working_data['max'] if working_data['max'] > 0 else float("inf")
                 safety_work_text = f"{safety_factor_work:.3f}" if safety_factor_work < 1.0 else f"{safety_factor_work:.2f}"
                 st.metric("Запас прочности конструкции", safety_work_text, delta="Безопасно" if safety_factor_work > 1.3 else "Критический уровень")

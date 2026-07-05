@@ -19,6 +19,13 @@ try:
 except Exception:
     REPORTLAB_AVAILABLE = False
 
+try:
+    import fem_solver
+    FEM_AVAILABLE = fem_solver.fem_available()
+except Exception:
+    fem_solver = None
+    FEM_AVAILABLE = False
+
 # Настройка страницы
 st.set_page_config(page_title="VibeCAE - Атоммаш & ЦИФРА", layout="wide")
 
@@ -140,13 +147,20 @@ def yield_strength_at_temp(material_data, temperature):
 
 def get_engineering_recommendations(result, params, norm_coef):
     recs = []
+    is_fem = bool(result.get("fem"))
     if result["analysis_type"] == "Модальный":
         f1 = result["first_frequency_hz"]
         if f1 is not None and SEISMIC_BAND_HZ[0] <= f1 <= SEISMIC_BAND_HZ[1]:
             recs.append("Первая частота попадает в сейсмический диапазон 0.5–33 Гц: требуется спектральный расчёт и/или повышение жёсткости.")
         else:
             recs.append("Первая частота вне сейсмического диапазона: допустима квазистатическая оценка сейсмики.")
-        recs.append("Балочная оценка частоты грубая: для ответственных узлов выполнить модальный КЭ-анализ.")
+        if is_fem:
+            te = result.get("total_effective_mass_kg")
+            mm_kg = result["mass_props"]["mass_kg"]
+            if te and mm_kg > 0 and min(te) / mm_kg < 0.9:
+                recs.append("Сумма эффективных масс 10 тонов < 90% по одной из осей: для спектрального расчёта увеличить число тонов.")
+        else:
+            recs.append("Балочная оценка частоты грубая: для ответственных узлов выполнить модальный КЭ-анализ (режим МКЭ).")
         return recs
 
     sigma_total = result["sigma_total"]
@@ -154,15 +168,19 @@ def get_engineering_recommendations(result, params, norm_coef):
     if safety < 1.0:
         recs.append("Напряжения превышают предел текучести: пересмотреть конструкцию, материал или схему закрепления.")
     elif safety < norm_coef:
-        recs.append(f"Запас ниже нормативного n = {norm_coef:g}: уточнить расчёт по КЭ-модели или снизить нагрузку.")
+        recs.append(f"Запас ниже нормативного n = {norm_coef:g}: уточнить расчёт или снизить нагрузку.")
+    elif is_fem:
+        recs.append("Запас достаточен по КЭ-расчёту; проверить сходимость по сетке (уменьшить размер КЭ и сравнить σmax).")
     else:
-        recs.append("Запас достаточен по экспресс-оценке; для НТС подтвердить поверочным КЭ-расчётом.")
+        recs.append("Запас достаточен по экспресс-оценке; для НТС подтвердить поверочным КЭ-расчётом (режим МКЭ).")
 
-    if result["sigma_bending"] > result["sigma_membrane"]:
+    if is_fem and result.get("sigma_p95") is not None and sigma_total > 3.0 * result["sigma_p95"] and sigma_total > 0:
+        recs.append("σmax значительно выше 95-го перцентиля — локальная концентрация (возможно, сингулярность у закрепления): оценить линеаризацией или сгущением сетки.")
+    if not is_fem and result["sigma_bending"] > result["sigma_membrane"]:
         recs.append("Преобладает изгиб: проверить плечо от зоны закрепления до зоны нагрузки и жёсткость сечения.")
     if float(params.get("temperature", 20)) > 150:
         recs.append(f"σт снижен по температуре до {result['sigma_yield_t']:.0f} МПа: проверить свойства материала по сертификату.")
-    if result["sigma_thermal"] > 0:
+    if not is_fem and result["sigma_thermal"] > 0:
         recs.append("Температурная составляющая — верхняя оценка при полном стеснении расширения; при свободном расширении она ниже.")
     if params.get("load_type") in ("Сейсмика", "Комбинированная") and float(params.get("seismic_g", 0.0)) <= 0:
         recs.append("Задано сейсмическое нагружение, но ускорение 0 g — укажите ускорение по спектру площадки.")
@@ -215,7 +233,7 @@ def build_nds_preview_png(coords, stress, scenario_name):
         return None
 
 
-def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, preview_png=None):
+def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, preview_png=None, use_fem=False):
     if not REPORTLAB_AVAILABLE:
         return None
 
@@ -244,7 +262,10 @@ def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, pre
     pdf.drawString(20 * mm, y, f"Количество сценариев: {len(report_rows)}")
     y -= 12 * mm
     pdf.setFont(font_name, 10)
-    pdf.drawString(20 * mm, y, "Оценка выполнена аналитическими формулами (без КЭ-решателя) и носит предварительный характер.")
+    if use_fem:
+        pdf.drawString(20 * mm, y, "Расчёт выполнен методом конечных элементов (CalculiX, тетраэдры C3D10 2-го порядка).")
+    else:
+        pdf.drawString(20 * mm, y, "Оценка выполнена аналитическими формулами (без КЭ-решателя) и носит предварительный характер.")
 
     pdf.showPage()
 
@@ -316,18 +337,32 @@ def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, pre
     pdf.drawString(20 * mm, y, "Методика и допущения")
     y -= 10 * mm
     pdf.setFont(font_name, 10)
-    methodology_lines = [
-        "1. Оценка выполнена аналитическими формулами без КЭ-решателя (экспресс-метод).",
-        "2. Мембранные напряжения: σм = F / Aср, где Aср = V / L — средняя площадь сечения вдоль силы.",
-        "3. Изгибные напряжения: σи = M / W по балочной модели «зона закрепления → зона нагрузки», W ≈ A·h/6.",
-        "4. Для шарнирного опирания изгибающий момент принят M ≈ F·L/4.",
-        "5. Температурные напряжения: верхняя оценка E·α·ΔT при полностью стеснённом расширении.",
-        "6. Предел текучести σт(T) интерполирован по справочной кривой снижения с температурой.",
-        "7. Первая собственная частота — балочная модель (метод Рэлея), консервативно по наименьшему габариту сечения.",
-        "8. Сейсмика учтена линейно-спектральным методом как эквивалентная статическая нагрузка m·a.",
-        "9. Концентрация напряжений (отверстия, галтели, сварные швы) не учитывается.",
-        "10. Результаты предназначены для предварительной оценки и не заменяют поверочный расчёт по КЭ-модели.",
-    ]
+    if use_fem:
+        methodology_lines = [
+            "1. Расчёт выполнен методом конечных элементов: решатель CalculiX, сетка gmsh из STEP-геометрии.",
+            "2. Элементы — тетраэдры 2-го порядка (C3D10); линейно-упругая постановка.",
+            "3. Гравитация и сейсмика — объёмные инерционные нагрузки; сейсмика задана квазистатически (ускорение в долях g).",
+            "4. Сосредоточенная сила и давление распределены по узлам области пропорционально площадям.",
+            "5. Масса содержимого — точечные массы на узлах области (участвуют в инерционных нагрузках и модальном анализе).",
+            "6. Температурный расчёт — равномерный нагрев от 20 °C с учётом реального стеснения закреплениями.",
+            "7. Модальный анализ: 10 тонов, частоты и эффективные модальные массы по осям X/Y/Z.",
+            "8. Оценка прочности — по максимальным узловым напряжениям по Мизесу; в зонах закреплений возможны особенности решения.",
+            "9. Предел текучести σт(T) интерполирован по справочной кривой; свойства материала уточнять по сертификату.",
+            "10. Контакты и сварные швы не моделируются: тела в STEP сшиты жёстко (общие узлы на границах).",
+        ]
+    else:
+        methodology_lines = [
+            "1. Оценка выполнена аналитическими формулами без КЭ-решателя (экспресс-метод).",
+            "2. Мембранные напряжения: σм = F / Aср, где Aср = V / L — средняя площадь сечения вдоль силы.",
+            "3. Изгибные напряжения: σи = M / W по балочной модели «зона закрепления → зона нагрузки», W ≈ A·h/6.",
+            "4. Для шарнирного опирания изгибающий момент принят M ≈ F·L/4.",
+            "5. Температурные напряжения: верхняя оценка E·α·ΔT при полностью стеснённом расширении.",
+            "6. Предел текучести σт(T) интерполирован по справочной кривой снижения с температурой.",
+            "7. Первая собственная частота — балочная модель (метод Рэлея), консервативно по наименьшему габариту сечения.",
+            "8. Сейсмика учтена линейно-спектральным методом как эквивалентная статическая нагрузка m·a.",
+            "9. Концентрация напряжений (отверстия, галтели, сварные швы) не учитывается.",
+            "10. Результаты предназначены для предварительной оценки и не заменяют поверочный расчёт по КЭ-модели.",
+        ]
     for line in methodology_lines:
         if y < 20 * mm:
             pdf.showPage()
@@ -848,7 +883,21 @@ with st.sidebar:
     st.caption(f"Допускаемое напряжение: [σ] = σт(T) / {norm_coef:g}")
 
     st.markdown("---")
-    st.markdown("*Режим: экспресс-оценка (аналитические формулы, без КЭ-решателя)*")
+    if FEM_AVAILABLE:
+        solver_mode = st.radio(
+            "Режим расчёта",
+            ["МКЭ (CalculiX)", "Экспресс-оценка (аналитика)"],
+            help="МКЭ — полноценный КЭ-расчёт: поля НДС, собственные частоты и эффективные массы. Требует STEP-файл.",
+        )
+        if solver_mode.startswith("МКЭ"):
+            fem_mesh_size = st.slider("Размер КЭ для МКЭ (мм)", 2.0, 20.0, 8.0, 0.5,
+                                      help="Тетраэдры 2-го порядка (C3D10). Меньше — точнее, но дольше счёт.")
+        else:
+            fem_mesh_size = 8.0
+    else:
+        solver_mode = "Экспресс-оценка (аналитика)"
+        fem_mesh_size = 8.0
+        st.markdown("*Режим: экспресс-оценка (CalculiX не найден — установите ccx для МКЭ)*")
 
 # Вкладки интерфейса
 tab1, tab2, tab3 = st.tabs([
@@ -1025,7 +1074,9 @@ with tab2:
             with st.expander(scenario, expanded=False):
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    analysis_type = st.selectbox(f"Тип расчета ({scenario[:20]}...)", ["Статический", "Температурный", "Модальный", "Спектральный"], key=f"analysis_type_{scenario}")
+                    _atype_opts = ["Статический", "Температурный", "Модальный", "Спектральный"]
+                    _atype_default = 2 if "Модальный анализ" in scenario else 0
+                    analysis_type = st.selectbox(f"Тип расчета ({scenario[:20]}...)", _atype_opts, index=_atype_default, key=f"analysis_type_{scenario}")
                     preset = get_analysis_preset(analysis_type)
                     st.caption(preset["description"])
                     st.slider(f"Температура для сценария ({scenario[:20]}...)", 20, 800, preset["default_temp"], key=f"temp_{scenario}")
@@ -1130,10 +1181,34 @@ with tab3:
     else:
         sigma_yield_20 = MATERIALS_GOST[selected_material]["yield_strength"]
         st.caption(f"Материал: {selected_material} | σт(20 °C) = {sigma_yield_20} МПа | Норма: {norm_name} (n = {norm_coef:g})")
-        st.info("💡 Экспресс-оценка аналитическими формулами: мембранные + изгибные + температурные напряжения, первая частота по методу Рэлея. Результаты — для предварительного сравнения сценариев, поверочный КЭ-расчёт они не заменяют.")
+
+        use_fem = FEM_AVAILABLE and solver_mode.startswith("МКЭ") and st.session_state.get('step_bytes') is not None
+        if FEM_AVAILABLE and solver_mode.startswith("МКЭ") and st.session_state.get('step_bytes') is None:
+            st.warning("Режим МКЭ требует STEP-файл (для STL доступна только экспресс-оценка). Использована аналитика.")
+
+        fem_mesh = None
+        if use_fem:
+            st.info("💡 Полноценный КЭ-расчёт (CalculiX): поля напряжений по Мизесу, перемещения, собственные частоты и эффективные массы.")
+            fem_key = (st.session_state.get('stl_name'), round(fem_mesh_size, 2))
+            if st.session_state.get('fem_mesh_key') != fem_key:
+                with st.spinner(f"Построение КЭ-сетки C3D10 (размер {fem_mesh_size:g} мм)..."):
+                    try:
+                        st.session_state['fem_mesh'] = fem_solver.build_fem_mesh_subprocess(
+                            st.session_state['step_bytes'], mesh_size_mm=fem_mesh_size)
+                        st.session_state['fem_mesh_key'] = fem_key
+                        st.session_state['fem_results_cache'] = {}
+                    except Exception as exc:
+                        st.error(f"Не удалось построить КЭ-сетку: {exc}")
+                        use_fem = False
+            fem_mesh = st.session_state.get('fem_mesh')
+            if fem_mesh is not None and use_fem:
+                st.caption(f"КЭ-сетка: {fem_mesh['n_nodes']:,} узлов, {fem_mesh['n_elements']:,} тетраэдров C3D10 (2-й порядок)")
+        if not use_fem:
+            st.info("💡 Экспресс-оценка аналитическими формулами: мембранные + изгибные + температурные напряжения, первая частота по методу Рэлея. Результаты — для предварительного сравнения сценариев, поверочный КЭ-расчёт они не заменяют.")
 
         coords = mesh.vertices[:, :3]
         scenario_results = []
+        fem_cache = st.session_state.setdefault('fem_results_cache', {})
 
         for scenario in selected_scenarios:
             analysis_type = st.session_state.get(f'analysis_type_{scenario}', 'Статический')
@@ -1177,8 +1252,23 @@ with tab3:
                 "scenario": scenario,
                 **region_settings,
             }
-            result = solve_scenario(mesh, material_data, params)
-            if result["analysis_type"] == "Модальный":
+            result = None
+            if use_fem and fem_mesh is not None:
+                cache_key = (scenario, selected_material, repr(sorted((k, str(v)) for k, v in params.items())))
+                result = fem_cache.get(cache_key)
+                if result is None:
+                    with st.spinner(f"КЭ-расчёт CalculiX: {scenario}..."):
+                        try:
+                            result = fem_solver.solve_scenario_fem(fem_mesh, material_data, params)
+                            fem_cache[cache_key] = result
+                        except Exception as exc:
+                            st.error(f"Ошибка КЭ-расчёта «{scenario}»: {exc}")
+                            result = None
+            if result is None:
+                result = solve_scenario(mesh, material_data, params)
+            if result.get("fem"):
+                field = result.get("viz_field")
+            elif result["analysis_type"] == "Модальный":
                 field = build_mode_shape_field(mesh, result)
             else:
                 field = build_display_stress_field(mesh, result)
@@ -1227,18 +1317,40 @@ with tab3:
                 with st.expander(scenario, expanded=True):
                     col_info, col_plot = st.columns([1, 2])
                     is_modal = result["analysis_type"] == "Модальный"
+                    is_fem = bool(result.get("fem"))
                     with col_info:
                         if is_modal:
                             f1 = result["first_frequency_hz"]
-                            st.metric("Первая собственная частота", f"≈ {f1:.1f} Гц" if f1 is not None else "н/д")
-                            st.caption(f"Балочная модель, {params['constraint_type'].lower()} | Масса: {result['total_mass_kg']:.1f} кг (модель {result['mass_props']['mass_kg']:.1f} кг)")
+                            st.metric("Первая собственная частота", f"{f1:.1f} Гц" if f1 is not None else "н/д")
+                            if is_fem:
+                                st.caption(f"КЭ модальный анализ (CalculiX) | Масса: {result['total_mass_kg']:.1f} кг (модель {result['mass_props']['mass_kg']:.1f} кг)")
+                            else:
+                                st.caption(f"Балочная модель, {params['constraint_type'].lower()} | Масса: {result['total_mass_kg']:.1f} кг (модель {result['mass_props']['mass_kg']:.1f} кг)")
                             if f1 is not None and SEISMIC_BAND_HZ[0] <= f1 <= SEISMIC_BAND_HZ[1]:
                                 st.error(f"Частота в сейсмическом диапазоне {SEISMIC_BAND_HZ[0]}–{SEISMIC_BAND_HZ[1]} Гц: возможен резонанс.")
                             else:
                                 st.success("Частота вне типового сейсмического диапазона 0.5–33 Гц.")
+                            if is_fem and result.get("modes"):
+                                st.caption("Собственные частоты и эффективные массы:")
+                                mode_rows = [{
+                                    "Тон": m["mode"],
+                                    "f, Гц": round(m["f_hz"], 1),
+                                    "mx, кг": round(m["effmass_x_kg"], 3),
+                                    "my, кг": round(m["effmass_y_kg"], 3),
+                                    "mz, кг": round(m["effmass_z_kg"], 3),
+                                } for m in result["modes"]]
+                                st.dataframe(mode_rows, hide_index=True, height=240)
+                                te = result.get("total_effective_mass_kg")
+                                if te:
+                                    mm_kg = result["mass_props"]["mass_kg"]
+                                    st.caption(f"Σ эфф. масс (10 тонов): X {te[0]:.2f} / Y {te[1]:.2f} / Z {te[2]:.2f} кг из {mm_kg:.2f} кг ({te[0]/mm_kg*100:.0f}% / {te[1]/mm_kg*100:.0f}% / {te[2]/mm_kg*100:.0f}%)")
                         else:
-                            st.metric("Макс. напряжение (оценка)", f"{result['sigma_total']:.1f} МПа")
-                            st.caption(f"σ мембранное: {result['sigma_membrane']:.1f} | σ изгибное: {result['sigma_bending']:.1f} | σ температурное: {result['sigma_thermal']:.1f} МПа")
+                            if is_fem:
+                                st.metric("Макс. напряжение (МКЭ, по Мизесу)", f"{result['sigma_total']:.1f} МПа")
+                                st.caption(f"95-й перцентиль: {result['sigma_p95']:.1f} МПа | Макс. перемещение: {result['max_disp_mm'] * 1000:.1f} мкм")
+                            else:
+                                st.metric("Макс. напряжение (оценка)", f"{result['sigma_total']:.1f} МПа")
+                                st.caption(f"σ мембранное: {result['sigma_membrane']:.1f} | σ изгибное: {result['sigma_bending']:.1f} | σ температурное: {result['sigma_thermal']:.1f} МПа")
                             st.caption(f"Суммарная нагрузка: {result['force_total_n']:,.0f} Н | Масса: {result['total_mass_kg']:.1f} кг (модель {result['mass_props']['mass_kg']:.1f} кг)")
                             if result["force_terms"]:
                                 st.caption("Составляющие нагрузки:")
@@ -1256,6 +1368,9 @@ with tab3:
                             st.metric("Запас прочности по σт(T)", safety_text, delta=status_text, delta_color=status_color)
                             if result["first_frequency_hz"] is not None:
                                 st.caption(f"Первая частота (справочно): ≈ {result['first_frequency_hz']:.1f} Гц")
+                            if is_fem and result.get("reactions_n"):
+                                rf = result["reactions_n"]
+                                st.caption(f"Реакции опор: ({rf[0]:,.0f}, {rf[1]:,.0f}, {rf[2]:,.0f}) Н")
 
                             if safety_factor < 1.0:
                                 st.error("Напряжения превышают предел текучести: требуется пересмотр конструкции или нагрузки.")
@@ -1269,21 +1384,41 @@ with tab3:
                             st.caption(f"• {rec}")
 
                     with col_plot:
-                        plot_coords, plot_field = sample_for_display(coords, field)
-                        fig = go.Figure()
-                        if is_modal:
-                            marker = dict(size=3, color=plot_field, colorscale='Viridis', cmin=0, cmax=1, showscale=True)
-                            plot_title = f"Форма 1-го тона (отн. перемещения): {scenario}"
+                        if is_fem and field is not None:
+                            vc = result["viz_coords"]
+                            vt = result["viz_tris"]
+                            if is_modal:
+                                colorscale, cmin, cmax = 'Viridis', 0.0, 1.0
+                                plot_title = f"Форма 1-го тона (МКЭ): {scenario}"
+                                cbar_title = "|U| отн."
+                            else:
+                                colorscale, cmin, cmax = 'Jet', 0.0, max(color_max, 1e-6)
+                                plot_title = f"Напряжения по Мизесу (МКЭ): {scenario}"
+                                cbar_title = "σ, МПа"
+                            fig = go.Figure(go.Mesh3d(
+                                x=vc[:, 0], y=vc[:, 1], z=vc[:, 2],
+                                i=vt[:, 0], j=vt[:, 1], k=vt[:, 2],
+                                intensity=field, colorscale=colorscale,
+                                cmin=cmin, cmax=cmax, showscale=True,
+                                colorbar=dict(title=cbar_title),
+                                lighting=dict(ambient=0.6, diffuse=0.8),
+                            ))
                         else:
-                            marker = dict(size=3, color=plot_field, colorscale='Jet', cmin=0, cmax=color_max, showscale=True)
-                            plot_title = f"Оценочное распределение напряжений: {scenario}"
-                        fig.add_trace(go.Scatter3d(
-                            x=plot_coords[:, 0],
-                            y=plot_coords[:, 1],
-                            z=plot_coords[:, 2],
-                            mode='markers',
-                            marker=marker
-                        ))
+                            plot_coords, plot_field = sample_for_display(coords, field)
+                            fig = go.Figure()
+                            if is_modal:
+                                marker = dict(size=3, color=plot_field, colorscale='Viridis', cmin=0, cmax=1, showscale=True)
+                                plot_title = f"Форма 1-го тона (отн. перемещения): {scenario}"
+                            else:
+                                marker = dict(size=3, color=plot_field, colorscale='Jet', cmin=0, cmax=color_max, showscale=True)
+                                plot_title = f"Оценочное распределение напряжений: {scenario}"
+                            fig.add_trace(go.Scatter3d(
+                                x=plot_coords[:, 0],
+                                y=plot_coords[:, 1],
+                                z=plot_coords[:, 2],
+                                mode='markers',
+                                marker=marker
+                            ))
                         fig.update_layout(
                             title=plot_title,
                             scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
@@ -1291,19 +1426,31 @@ with tab3:
                             margin=dict(l=0, r=0, b=0, t=40),
                         )
                         st.plotly_chart(fig)
-                        if not is_modal:
+                        if not is_modal and not is_fem:
                             st.caption("Распределение качественное: мембранная и температурная части равномерны, изгибная нарастает к зоне закрепления. Максимум карты равен расчётному σmax.")
 
-            with st.expander("Методика и допущения экспресс-оценки"):
-                st.markdown(
-                    "- Мембранные напряжения: σм = F / Aср, где Aср = V / L — средняя площадь сечения вдоль направления равнодействующей.\n"
-                    "- Изгибные напряжения: σи = M / W по балочной модели «зона закрепления → зона нагрузки», W ≈ A·h/6; для шарнирного опирания M ≈ F·L/4.\n"
-                    "- Температурные напряжения: верхняя оценка E·α·ΔT при полностью стеснённом расширении (для шарнирного опирания — коэффициент 0.3).\n"
-                    "- Предел текучести σт(T) интерполируется по справочной кривой снижения с температурой.\n"
-                    "- Первая собственная частота — балочная модель (метод Рэлея) по наименьшему поперечному габариту (консервативно).\n"
-                    "- Сейсмика учитывается линейно-спектральным методом как эквивалентная статическая нагрузка m·a.\n"
-                    "- Концентрация напряжений (отверстия, галтели) не учитывается. Результаты не заменяют поверочный КЭ-расчёт."
-                )
+            with st.expander("Методика и допущения"):
+                if use_fem:
+                    st.markdown(
+                        "- КЭ-расчёт: CalculiX (ccx), тетраэдры 2-го порядка C3D10, сетка gmsh из STEP-геометрии.\n"
+                        "- Статика: линейно-упругий расчёт; гравитация и сейсмика — объёмные инерционные нагрузки; сила и давление распределяются по узлам области пропорционально площадям.\n"
+                        "- Масса содержимого — точечные массы на узлах области нагрузки (участвуют в гравитации, сейсмике и модальном анализе).\n"
+                        "- Температурный расчёт: равномерный нагрев от 20 °C до заданной T с закреплением — реальное стеснение расширения (не верхняя оценка).\n"
+                        "- Модальный анализ: 10 тонов, частоты и эффективные модальные массы по X/Y/Z.\n"
+                        "- Оценка прочности — по максимальным узловым напряжениям по Мизесу; в зонах закрепления возможны сингулярности — см. 95-й перцентиль и рекомендации.\n"
+                        "- Сейсмика задаётся квазистатически (ускорение в g); полный линейно-спектральный метод по поэтажным спектрам — в разработке.\n"
+                        "- Контакты и сварные швы не моделируются: несколько тел в STEP сшиваются жёстко (общие узлы)."
+                    )
+                else:
+                    st.markdown(
+                        "- Мембранные напряжения: σм = F / Aср, где Aср = V / L — средняя площадь сечения вдоль направления равнодействующей.\n"
+                        "- Изгибные напряжения: σи = M / W по балочной модели «зона закрепления → зона нагрузки», W ≈ A·h/6; для шарнирного опирания M ≈ F·L/4.\n"
+                        "- Температурные напряжения: верхняя оценка E·α·ΔT при полностью стеснённом расширении (для шарнирного опирания — коэффициент 0.3).\n"
+                        "- Предел текучести σт(T) интерполируется по справочной кривой снижения с температурой.\n"
+                        "- Первая собственная частота — балочная модель (метод Рэлея) по наименьшему поперечному габариту (консервативно).\n"
+                        "- Сейсмика учитывается линейно-спектральным методом как эквивалентная статическая нагрузка m·a.\n"
+                        "- Концентрация напряжений (отверстия, галтели) не учитывается. Результаты не заменяют поверочный КЭ-расчёт."
+                    )
 
             st.markdown("---")
             if REPORTLAB_AVAILABLE:
@@ -1348,10 +1495,11 @@ with tab3:
                         if worst_case is not None:
                             for scenario, _, result, field in scenario_results:
                                 if scenario == worst_case["scenario"]:
-                                    preview_png = build_nds_preview_png(coords, field, scenario)
+                                    preview_coords = result["viz_coords"] if result.get("fem") else coords
+                                    preview_png = build_nds_preview_png(preview_coords, field, scenario)
                                     break
 
-                        pdf_data = build_pdf_report_bytes(selected_material, norm_name, norm_coef, report_rows, preview_png=preview_png)
+                        pdf_data = build_pdf_report_bytes(selected_material, norm_name, norm_coef, report_rows, preview_png=preview_png, use_fem=use_fem)
                     if pdf_data is not None:
                         st.session_state['pdf_report'] = pdf_data
                     else:

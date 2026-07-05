@@ -218,11 +218,12 @@ def _write_nset(f, name, ids):
 
 
 def write_inp(path, fem, material_data, params):
-    """Формирует .inp для статического/температурного или модального расчёта."""
+    """Формирует .inp для статического/температурного, модального или спектрального расчёта."""
     coords = fem["node_coords"]
     node_ids = fem["node_ids"]
     analysis_type = params.get("analysis_type", "Статический")
-    is_modal = analysis_type == "Модальный"
+    is_spectral = analysis_type == "Спектральный"
+    is_modal = analysis_type == "Модальный" or is_spectral
 
     e_mpa = float(material_data["elastic_modulus"]) * 1000.0
     nu = float(material_data.get("poisson", 0.3))
@@ -291,6 +292,8 @@ def write_inp(path, fem, material_data, params):
         if is_modal:
             f.write(f"*FREQUENCY\n{N_MODES}\n")
             f.write("*NODE FILE\nU\n")
+            if is_spectral:
+                f.write("*EL FILE\nS\n")  # напряжения собственных форм
         else:
             f.write("*STATIC\n")
             if g_mag > 1e-9:
@@ -418,6 +421,42 @@ def parse_modal_dat(text):
     return freqs, eff_rows, total_eff
 
 
+def parse_participation_dat(text):
+    """Коэффициенты участия Γ по X/Y/Z для каждого тона из .dat CalculiX."""
+    rows = []
+    section = None
+    for ln in text.splitlines():
+        if "P A R T I C I P A T I O N   F A C T O R S" in ln:
+            section = "part"
+            continue
+        if "E F F E C T I V E   M O D A L   M A S S" in ln:
+            section = None
+            continue
+        s = ln.strip()
+        if section != "part" or not s or not s[0].isdigit():
+            continue
+        parts = s.split()
+        try:
+            row = [float(p) for p in parts]
+        except ValueError:
+            continue
+        if len(row) >= 4:
+            rows.append(row[1:4])  # Γx, Γy, Γz (норм. на ед. обобщённую массу, т^0.5)
+    return rows
+
+
+def interp_spectrum(freqs_hz, spectrum_points):
+    """Спектральные ускорения Sa (в g) для частот тонов; интерполяция по log(f),
+    за пределами таблицы — ближайшее значение."""
+    pts = sorted((float(f), float(a)) for f, a in spectrum_points if float(f) > 0)
+    if not pts:
+        return np.zeros(len(freqs_hz))
+    fs = np.array([p[0] for p in pts])
+    sas = np.array([p[1] for p in pts])
+    fq = np.clip(np.asarray(freqs_hz, dtype=float), fs[0], fs[-1])
+    return np.interp(np.log(fq), np.log(fs), sas)
+
+
 def _von_mises(s6):
     sx, sy, sz, sxy, syz, szx = (s6[:, k] for k in range(6))
     return np.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2)
@@ -443,6 +482,7 @@ def solve_scenario_fem(fem, material_data, params):
     id2idx = {int(nid): i for i, nid in enumerate(node_ids)}
     analysis_type = params.get("analysis_type", "Статический")
     is_modal = analysis_type == "Модальный"
+    is_spectral = analysis_type == "Спектральный"
 
     rho = float(material_data.get("density", 7850.0))
     model_mass_kg = rho * fem["volume_mm3"] * 1e-9
@@ -499,6 +539,68 @@ def solve_scenario_fem(fem, material_data, params):
                             "value_n": meta["pressure_force_n"], "direction": direction_label})
     result["force_terms"] = force_terms
     result["force_total_n"] = float(sum(abs(t["value_n"]) for t in force_terms))
+
+    if is_spectral:
+        # Линейно-спектральный метод: отклик тона q_j = Γ_j·Sa(f_j)/ω_j²,
+        # комбинация тонов — SRSS по компонентам; статика (НУЭ) + спектр —
+        # алгебраическая сумма полей Мизеса (консервативно).
+        freqs, eff_rows, total_eff = parse_modal_dat(dat_text)
+        gammas = parse_participation_dat(dat_text)
+        axis = {"X": 0, "Y": 1, "Z": 2}[params.get("direction", "+X").strip("+-") or "X"]
+        sg = float(params.get("seismic_g", 0.0)) or 0.5
+        spectrum_points = params.get("spectrum_points") or [(0.5, sg), (33.0, sg)]
+        sa_g = interp_spectrum(freqs, spectrum_points)
+        omega2 = (2.0 * np.pi * np.array(freqs)) ** 2
+
+        disp_blocks = [b for b in blocks if b["name"] == "DISP"]
+        stress_blocks = [b for b in blocks if b["name"] == "STRESS"]
+        n = len(coords)
+        u2 = np.zeros((n, 3))
+        s2 = np.zeros((n, 6))
+        modes = []
+        n_use = min(len(freqs), len(disp_blocks), len(stress_blocks))
+        for j in range(n_use):
+            gam = gammas[j][axis] if j < len(gammas) else 0.0
+            q = gam * sa_g[j] * GRAVITY_MM_S2 / omega2[j] if omega2[j] > 0 else 0.0
+            uj = np.zeros((n, 3))
+            sj = np.zeros((n, 6))
+            for nid, vals in disp_blocks[j]["data"].items():
+                uj[id2idx[nid]] = vals[:3]
+            for nid, vals in stress_blocks[j]["data"].items():
+                sj[id2idx[nid]] = vals[:6]
+            u2 += (q * uj) ** 2
+            s2 += (q * sj) ** 2
+            em = eff_rows[j] if j < len(eff_rows) else [0.0, 0.0, 0.0]
+            modes.append({"mode": j + 1, "f_hz": freqs[j], "sa_g": float(sa_g[j]),
+                          "effmass_x_kg": em[0], "effmass_y_kg": em[1], "effmass_z_kg": em[2]})
+
+        u_spec = np.sqrt(u2)
+        umag_spec = np.linalg.norm(u_spec, axis=1)
+        vm_spec = _von_mises(np.sqrt(s2))
+
+        # статическая часть НУЭ: вес + эксплуатационные нагрузки, без квазистатической сейсмики
+        static_params = dict(params)
+        static_params.update(analysis_type="Статический", load_type="Гравитация", seismic_g=0.0)
+        stat = solve_scenario_fem(fem, material_data, static_params)
+
+        vm_comb = np.asarray(stat["viz_field"]) + vm_spec
+        disp_comb = np.asarray(stat["disp_field_mm"]) + umag_spec
+        result["modes"] = modes
+        if total_eff is None and eff_rows:
+            total_eff = [float(sum(r[k] for r in eff_rows)) for k in range(3)]
+        result["total_effective_mass_kg"] = total_eff
+        result["first_frequency_hz"] = freqs[0] if freqs else None
+        result["spectrum_points"] = [(float(f), float(a)) for f, a in spectrum_points]
+        result["spectrum_axis"] = "XYZ"[axis]
+        result["sigma_spectral"] = float(vm_spec.max())
+        result["sigma_static_part"] = float(stat["sigma_total"])
+        result["sigma_total"] = float(vm_comb.max())
+        result["sigma_p95"] = float(np.percentile(vm_comb, 95))
+        result["max_disp_mm"] = float(disp_comb.max())
+        result["viz_field"] = vm_comb
+        result["disp_field_mm"] = disp_comb
+        result["reactions_n"] = stat["reactions_n"]
+        return result
 
     if is_modal:
         freqs, eff_rows, total_eff = parse_modal_dat(dat_text)

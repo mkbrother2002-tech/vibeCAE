@@ -122,7 +122,7 @@ ANALYSIS_PRESETS = {
         "default_direction": "+X",
     },
     "Спектральный": {
-        "description": "Линейно-спектральный метод: сейсмическое ускорение учитывается как эквивалентная статическая нагрузка.",
+        "description": "Линейно-спектральный метод (МКЭ): отклик тонов по огибающей поэтажного спектра, комбинация SRSS + статика НУЭ. В экспресс-режиме — эквивалентная статическая нагрузка m·a.",
         "default_temp": 20,
         "default_load_type": "Сейсмика",
         "default_direction": "+X",
@@ -176,6 +176,12 @@ def get_engineering_recommendations(result, params, norm_coef):
 
     if is_fem and result.get("sigma_p95") is not None and sigma_total > 3.0 * result["sigma_p95"] and sigma_total > 0:
         recs.append("σmax значительно выше 95-го перцентиля — локальная концентрация (возможно, сингулярность у закрепления): оценить линеаризацией или сгущением сетки.")
+    if is_fem and result["analysis_type"] == "Спектральный":
+        te = result.get("total_effective_mass_kg")
+        mm_kg = result["mass_props"]["mass_kg"]
+        axis_i = {"X": 0, "Y": 1, "Z": 2}.get(result.get("spectrum_axis", "X"), 0)
+        if te and mm_kg > 0 and te[axis_i] / mm_kg < 0.9:
+            recs.append(f"Эффективная масса по оси {result.get('spectrum_axis')} = {te[axis_i] / mm_kg * 100:.0f}% < 90%: часть отклика не учтена — увеличить число тонов или добавить поправку на остаточную массу.")
     if not is_fem and result["sigma_bending"] > result["sigma_membrane"]:
         recs.append("Преобладает изгиб: проверить плечо от зоны закрепления до зоны нагрузки и жёсткость сечения.")
     if float(params.get("temperature", 20)) > 150:
@@ -1089,6 +1095,12 @@ with tab2:
                     st.number_input(f"Давление на область, МПа ({scenario[:20]}...)", min_value=0.0, value=0.0, step=0.05, format="%.2f", key=f"pressure_{scenario}", help="Равнодействующая = давление × площадь выбранной области.")
                     if load_type in ("Сейсмика", "Комбинированная"):
                         st.number_input(f"Сейсмическое ускорение, g ({scenario[:20]}...)", min_value=0.0, max_value=5.0, value=0.5, step=0.1, key=f"seismic_{scenario}", help="Ускорение по спектру площадки; инерционная сила = m·a.")
+                    if analysis_type == "Спектральный":
+                        st.text_area(
+                            f"Спектр ответа: f(Гц) Sa(g) по строке ({scenario[:20]}...)",
+                            value="0.5 0.1\n2 0.5\n10 0.5\n33 0.2",
+                            height=120, key=f"spectrum_{scenario}",
+                            help="Огибающая поэтажного спектра ответа (ПЗ/МРЗ). Между точками — интерполяция по log f, за пределами — ближайшее значение. Ось возбуждения — «Направление нагрузки».")
 
                 st.caption("Закрепление модели для этого сценария")
                 cc1, cc2, cc3 = st.columns(3)
@@ -1252,6 +1264,17 @@ with tab3:
                 "scenario": scenario,
                 **region_settings,
             }
+            if analysis_type == "Спектральный":
+                spec_pts = []
+                for ln in str(st.session_state.get(f'spectrum_{scenario}', '')).splitlines():
+                    parts = ln.replace(',', ' ').replace(';', ' ').split()
+                    if len(parts) >= 2:
+                        try:
+                            spec_pts.append((float(parts[0]), float(parts[1])))
+                        except ValueError:
+                            pass
+                if spec_pts:
+                    params["spectrum_points"] = spec_pts
             result = None
             if use_fem and fem_mesh is not None:
                 cache_key = (scenario, selected_material, repr(sorted((k, str(v)) for k, v in params.items())))
@@ -1348,6 +1371,12 @@ with tab3:
                             if is_fem:
                                 st.metric("Макс. напряжение (МКЭ, по Мизесу)", f"{result['sigma_total']:.1f} МПа")
                                 st.caption(f"95-й перцентиль: {result['sigma_p95']:.1f} МПа | Макс. перемещение: {result['max_disp_mm'] * 1000:.1f} мкм")
+                                if result["analysis_type"] == "Спектральный" and result.get("sigma_spectral") is not None:
+                                    st.caption(f"Линейно-спектральный метод (SRSS, {len(result.get('modes', []))} тонов, ось {result.get('spectrum_axis', '?')}): σ спектр {result['sigma_spectral']:.1f} + σ НУЭ {result['sigma_static_part']:.1f} МПа")
+                                    if result.get("modes"):
+                                        sa_rows = [{"Тон": m["mode"], "f, Гц": round(m["f_hz"], 1), "Sa, g": round(m.get("sa_g", 0.0), 3)} for m in result["modes"]]
+                                        with st.expander("Sa по тонам"):
+                                            st.dataframe(sa_rows, hide_index=True, height=220)
                             else:
                                 st.metric("Макс. напряжение (оценка)", f"{result['sigma_total']:.1f} МПа")
                                 st.caption(f"σ мембранное: {result['sigma_membrane']:.1f} | σ изгибное: {result['sigma_bending']:.1f} | σ температурное: {result['sigma_thermal']:.1f} МПа")
@@ -1438,7 +1467,8 @@ with tab3:
                         "- Температурный расчёт: равномерный нагрев от 20 °C до заданной T с закреплением — реальное стеснение расширения (не верхняя оценка).\n"
                         "- Модальный анализ: 10 тонов, частоты и эффективные модальные массы по X/Y/Z.\n"
                         "- Оценка прочности — по максимальным узловым напряжениям по Мизесу; в зонах закрепления возможны сингулярности — см. 95-й перцентиль и рекомендации.\n"
-                        "- Сейсмика задаётся квазистатически (ускорение в g); полный линейно-спектральный метод по поэтажным спектрам — в разработке.\n"
+                        "- Спектральный тип: линейно-спектральный метод — отклик тона q = Γ·Sa(f)/ω² по огибающей поэтажного спектра, комбинация тонов SRSS, сложение с НУЭ — по полям Мизеса (консервативно); контролируйте полноту эффективных масс по оси возбуждения.\n"
+                        "- Сейсмика в статических сценариях — квазистатически (ускорение в g).\n"
                         "- Контакты и сварные швы не моделируются: несколько тел в STEP сшиваются жёстко (общие узлы)."
                     )
                 else:

@@ -1,6 +1,7 @@
 streamlit>=1.28.0
 numpy>=1.24.0
 plotly>=5.17.0
-trimesh>=3.20.0
+trimesh>=4.0.0
 cadquery>=2.3.0
 reportlab>=4.0.0
+kaleido>=0.2.1

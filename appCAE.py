@@ -1096,6 +1096,11 @@ with tab2:
                     if load_type in ("Сейсмика", "Комбинированная"):
                         st.number_input(f"Сейсмическое ускорение, g ({scenario[:20]}...)", min_value=0.0, max_value=5.0, value=0.5, step=0.1, key=f"seismic_{scenario}", help="Ускорение по спектру площадки; инерционная сила = m·a.")
                     if analysis_type == "Спектральный":
+                        st.selectbox(
+                            f"Сочетание нагрузок ({scenario[:20]}...)",
+                            ["НУЭ+ПЗ ([σ]×1.2)", "НУЭ+МРЗ ([σ]×1.4)"],
+                            key=f"seism_combo_{scenario}",
+                            help="Категория допускаемых по ПНАЭ Г-7-002-86: для сочетаний с ПЗ допускаемые напряжения повышаются в 1.2 раза, с МРЗ — в 1.4 раза.")
                         st.text_area(
                             f"Спектр ответа: f(Гц) Sa(g) по строке ({scenario[:20]}...)",
                             value="0.5 0.1\n2 0.5\n10 0.5\n33 0.2",
@@ -1265,6 +1270,9 @@ with tab3:
                 **region_settings,
             }
             if analysis_type == "Спектральный":
+                combo = st.session_state.get(f'seism_combo_{scenario}', 'НУЭ+ПЗ ([σ]×1.2)')
+                params["seism_combo"] = "НУЭ+МРЗ" if "МРЗ" in combo else "НУЭ+ПЗ"
+                params["allow_factor"] = 1.4 if "МРЗ" in combo else 1.2
                 spec_pts = []
                 for ln in str(st.session_state.get(f'spectrum_{scenario}', '')).splitlines():
                     parts = ln.replace(',', ' ').replace(';', ' ').split()
@@ -1306,7 +1314,9 @@ with tab3:
             st.subheader("Сравнение сценариев")
             comparison_rows = []
             for scenario, params, result, field in scenario_results:
-                sigma_allow = result["sigma_yield_t"] / norm_coef
+                allow_k = float(params.get("allow_factor", 1.0))
+                norm_eff = norm_coef / allow_k
+                sigma_allow = result["sigma_yield_t"] / norm_eff
                 if result["analysis_type"] == "Модальный":
                     f1 = result["first_frequency_hz"]
                     in_band = f1 is not None and SEISMIC_BAND_HZ[0] <= f1 <= SEISMIC_BAND_HZ[1]
@@ -1329,9 +1339,9 @@ with tab3:
                         "Температура, °C": params['temperature'],
                         "σт(T), МПа": round(result["sigma_yield_t"], 0),
                         "Результат": f"σmax ≈ {sigma_total:.1f} МПа",
-                        "Критерий": f"[σ] = {sigma_allow:.1f} МПа",
+                        "Критерий": f"[σ] = {sigma_allow:.1f} МПа" + (f" ({params['seism_combo']})" if allow_k > 1.0 else ""),
                         "Запас": round(safety_factor, 2) if np.isfinite(safety_factor) else "∞",
-                        "Вердикт": "Пройдён" if safety_factor >= norm_coef else "Не пройдён",
+                        "Вердикт": "Пройдён" if safety_factor >= norm_eff else "Не пройдён",
                     })
             if comparison_rows:
                 st.dataframe(comparison_rows, width='stretch', hide_index=True)
@@ -1388,12 +1398,15 @@ with tab3:
                             else:
                                 st.warning("Нагрузки не заданы: укажите вес, силу, давление или ускорение на вкладке 2.")
 
-                            sigma_allow = result["sigma_yield_t"] / norm_coef
-                            st.caption(f"σт({params['temperature']} °C) = {result['sigma_yield_t']:.0f} МПа | [σ] = {sigma_allow:.0f} МПа (n = {norm_coef:g})")
+                            allow_k = float(params.get("allow_factor", 1.0))
+                            norm_eff = norm_coef / allow_k
+                            sigma_allow = result["sigma_yield_t"] / norm_eff
+                            combo_note = f" | сочетание {params['seism_combo']}: [σ]×{allow_k:g}" if allow_k > 1.0 else ""
+                            st.caption(f"σт({params['temperature']} °C) = {result['sigma_yield_t']:.0f} МПа | [σ] = {sigma_allow:.0f} МПа (n = {norm_coef:g}){combo_note}")
                             safety_factor = result["sigma_yield_t"] / result["sigma_total"] if result["sigma_total"] > 0 else float("inf")
                             safety_text = f"{safety_factor:.2f}" if np.isfinite(safety_factor) else "∞"
-                            status_text = "Пройдён" if safety_factor >= norm_coef else "Не пройдён"
-                            status_color = "normal" if safety_factor >= norm_coef else "inverse"
+                            status_text = "Пройдён" if safety_factor >= norm_eff else "Не пройдён"
+                            status_color = "normal" if safety_factor >= norm_eff else "inverse"
                             st.metric("Запас прочности по σт(T)", safety_text, delta=status_text, delta_color=status_color)
                             if result["first_frequency_hz"] is not None:
                                 st.caption(f"Первая частота (справочно): ≈ {result['first_frequency_hz']:.1f} Гц")
@@ -1403,13 +1416,13 @@ with tab3:
 
                             if safety_factor < 1.0:
                                 st.error("Напряжения превышают предел текучести: требуется пересмотр конструкции или нагрузки.")
-                            elif safety_factor < norm_coef:
-                                st.warning(f"Запас ниже нормативного n = {norm_coef:g}: требуется уточнение.")
+                            elif safety_factor < norm_eff:
+                                st.warning(f"Запас ниже требуемого {norm_eff:.2f}: требуется уточнение.")
                             else:
                                 st.success("Сценарий допустим по экспресс-оценке.")
 
                         st.caption("Что проверить дальше:")
-                        for rec in get_engineering_recommendations(result, params, norm_coef):
+                        for rec in get_engineering_recommendations(result, params, norm_coef / float(params.get("allow_factor", 1.0))):
                             st.caption(f"• {rec}")
 
                     with col_plot:
@@ -1468,6 +1481,8 @@ with tab3:
                         "- Модальный анализ: 10 тонов, частоты и эффективные модальные массы по X/Y/Z.\n"
                         "- Оценка прочности — по максимальным узловым напряжениям по Мизесу; в зонах закрепления возможны сингулярности — см. 95-й перцентиль и рекомендации.\n"
                         "- Спектральный тип: линейно-спектральный метод — отклик тона q = Γ·Sa(f)/ω² по огибающей поэтажного спектра, комбинация тонов SRSS, сложение с НУЭ — по полям Мизеса (консервативно); контролируйте полноту эффективных масс по оси возбуждения.\n"
+                        "- Допускаемые для сейсмических сочетаний (ПНАЭ Г-7-002-86): НУЭ+ПЗ — [σ]×1.2, НУЭ+МРЗ — [σ]×1.4.\n"
+                        "- Сейсмика в статических сценариях — квазистатически (ускорение в g).\n"
                         "- Сейсмика в статических сценариях — квазистатически (ускорение в g).\n"
                         "- Контакты и сварные швы не моделируются: несколько тел в STEP сшиваются жёстко (общие узлы)."
                     )
@@ -1504,15 +1519,17 @@ with tab3:
                         else:
                             sigma_total = result["sigma_total"]
                             safety_factor = result["sigma_yield_t"] / sigma_total if sigma_total > 0 else float("inf")
-                            sigma_allow = result["sigma_yield_t"] / norm_coef
+                            allow_k = float(params.get("allow_factor", 1.0))
+                            norm_eff = norm_coef / allow_k
+                            sigma_allow = result["sigma_yield_t"] / norm_eff
                             row = {
                                 "scenario": scenario,
                                 "analysis_type": result["analysis_type"],
                                 "temperature": params['temperature'],
                                 "result_text": f"{sigma_total:.1f} МПа",
-                                "allow_text": f"{sigma_allow:.1f} МПа",
+                                "allow_text": f"{sigma_allow:.1f} МПа" + (f" ({params['seism_combo']})" if allow_k > 1.0 else ""),
                                 "safety_text": f"{safety_factor:.2f}" if np.isfinite(safety_factor) else "∞",
-                                "verdict": "Пройдён" if safety_factor >= norm_coef else "Не пройдён",
+                                "verdict": "Пройдён" if safety_factor >= norm_eff else "Не пройдён",
                                 "safety_sort": safety_factor,
                             }
                         report_rows.append(row)

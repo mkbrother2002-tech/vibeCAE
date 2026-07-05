@@ -1,8 +1,8 @@
 # VibeCAE - Engineering CAE Analysis Platform
 
-**VibeCAE** is a Streamlit-based interactive tool for rapid engineering screening of loading scenarios on 3D models. It provides mesh visualization, physics-based analytical stress estimation (membrane + bending + thermal), natural frequency estimation, and automated PDF reporting.
+**VibeCAE** is a Streamlit-based interactive tool for engineering screening of loading scenarios on 3D models. It provides mesh visualization, stress analysis (analytical formulas or a real FEM backend), modal analysis, response-spectrum seismic analysis, and automated PDF reporting.
 
-> **Note:** Stress and frequency values are computed with analytical engineering formulas (beam/section models), **not** a finite element solver. All loads are entered in physical units (N, MPa, g, kg). Results are suitable for preliminary screening and order-of-magnitude checks; they must not be used as a substitute for verified FEA calculations. Stress concentration (holes, fillets, welds) is not captured.
+> **Note:** Two calculation modes are available. The analytical mode uses beam/section engineering formulas for order-of-magnitude checks. The FEM mode (Level 2) runs a real finite element analysis with gmsh + CalculiX: linear-elastic C3D10 (quadratic tetrahedra) static, thermal, modal, and response-spectrum solutions. Contacts and welds are not modeled (multi-body STEP assemblies are merged with shared nodes); results are for engineering screening, not certified design verification.
 
 ## Features
 
@@ -22,8 +22,17 @@
   - Multiple simultaneous scenarios
   - Physical load inputs: self-weight, contents mass (kg), point force (N), pressure (MPa), seismic acceleration (g)
   - Boundary conditions per scenario: constraint face, fixed/pinned type, zone depth
-  - Analysis types: static, thermal (E·α·ΔT upper bound), modal (Rayleigh beam estimate), spectral (quasi-static seismic)
-  - Allowable stress [σ] = σy(T)/n verdicts per selected norm
+  - Analysis types: static, thermal, modal, spectral (response-spectrum seismic)
+  - Allowable stress [σ] = σy(T)/n verdicts per selected norm; for seismic combinations per PNAE G-7-002-86: NOC+DE (НУЭ+ПЗ) — [σ]×1.2, NOC+SSE (НУЭ+МРЗ) — [σ]×1.4
+
+- **FEM Backend (Level 2, gmsh + CalculiX)**
+  - Volume meshing of STEP geometry with quadratic tetrahedra (C3D10), configurable element size
+  - Static analysis: gravity + quasi-static seismic as body loads, point force / pressure distributed over the load region by nodal areas, contents as point masses, support reaction check
+  - Thermal analysis: uniform heating with real constrained-expansion stresses (not an upper-bound estimate)
+  - Modal analysis: 10 modes, natural frequencies and effective modal masses per X/Y/Z
+  - Response-spectrum method: per-mode response q = Γ·Sa(f)/ω² from a user floor-response spectrum, SRSS mode combination, conservative superposition with the static (NOC) von Mises field; effective-mass completeness check along the excitation axis
+  - Von Mises stress maps on the surface mesh, 95th-percentile reporting to flag constraint singularities
+  - Verified against beam theory: see `test_verification.py` (cantilever 200×20×10 mm — tip deflection 0.7 %, mid-span stress 0.03 %, reactions 0.00 %, f1/f2 within 0.5 % of theory)
 
 - **Results & Reporting**
   - Stress breakdown: membrane σ=F/A, bending σ=M/W, thermal components
@@ -35,6 +44,25 @@
 
 ```bash
 pip install -r requirements.txt
+```
+
+### FEM backend (optional, Level 2)
+
+The FEM mode requires gmsh (meshing) and CalculiX `ccx` (solver):
+
+```bash
+pip install gmsh                    # meshing (already in requirements.txt)
+
+# CalculiX via conda-forge (micromamba/conda):
+micromamba create -p ~/.local/ccx-env -c conda-forge calculix
+```
+
+The application looks for `ccx` in `PATH` and in `~/.local/ccx-env/bin/ccx`. If either component is missing, the app falls back to analytical mode automatically.
+
+To run the verification suite:
+
+```bash
+python test_verification.py
 ```
 
 ## Running the Application
@@ -53,8 +81,10 @@ streamlit run appCAE.py
 
 ```
 VibeCAE/
-├── appCAE.py           # Main Streamlit application
-└── requirements.txt    # Python dependencies
+├── appCAE.py              # Main Streamlit application
+├── fem_solver.py          # FEM backend: gmsh meshing, CalculiX .inp/.frd/.dat, spectral method
+├── test_verification.py   # FEM verification against beam theory (cantilever)
+└── requirements.txt       # Python dependencies
 ```
 
 ## Technology Stack
@@ -63,6 +93,8 @@ VibeCAE/
 - **NumPy**: Numerical computations
 - **Trimesh**: 3D mesh processing
 - **CadQuery/OCP**: STEP file import and tessellation
+- **gmsh**: Volume meshing (C3D10) for the FEM backend
+- **CalculiX (ccx)**: Finite element solver
 - **Plotly + Kaleido**: Interactive 3D visualizations and static image export
 - **ReportLab**: PDF generation
 
@@ -70,7 +102,8 @@ VibeCAE/
 
 This application follows a modular architecture with clear separation:
 - Material databases (with σy(T) curves) and normative safety factors
-- Analytical solver behind a `solve_scenario(mesh, material, params)` interface — designed to be swapped for an FEA backend (gmsh + CalculiX) without UI changes
+- Two interchangeable solvers behind the same result contract: analytical `solve_scenario(mesh, material, params)` and FEM `fem_solver.solve_scenario_fem(fem, material, params)`
+- gmsh meshing runs in a subprocess (`build_fem_mesh_subprocess`) — gmsh is not thread-safe inside the Streamlit server
 - 3D mesh processing utilities
 - UI components (3 tabs)
 - Report generation pipeline

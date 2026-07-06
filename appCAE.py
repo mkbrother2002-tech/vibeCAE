@@ -145,6 +145,73 @@ def yield_strength_at_temp(material_data, temperature):
     return float(np.interp(float(temperature), temps, values))
 
 
+def get_reinforcement_recommendations(result, params, norm_eff):
+    """Конкретные меры усиления конструкции, когда запас ниже требуемого."""
+    recs = []
+    sigma_total = result.get("sigma_total", 0.0)
+    if sigma_total <= 0:
+        return recs
+    sigma_allow = result["sigma_yield_t"] / norm_eff
+    k_need = sigma_total / sigma_allow
+    if k_need <= 1.0:
+        return recs
+
+    recs.append(f"Для выполнения критерия напряжения нужно снизить в {k_need:.2f} раза (σmax = {sigma_total:.1f} МПа при [σ] = {sigma_allow:.1f} МПа). Меры усиления:")
+
+    is_fem = bool(result.get("fem"))
+    analysis_type = result["analysis_type"]
+
+    # локализация максимума (МКЭ): где именно усиливать
+    if is_fem and result.get("viz_field") is not None:
+        coords = np.asarray(result["viz_coords"])
+        field = np.asarray(result["viz_field"])
+        if len(field) == len(coords) and len(field) > 0:
+            hotspot = coords[int(np.argmax(field))]
+            diag = float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
+            d_con = float(np.linalg.norm(hotspot - np.asarray(result["constraint_centroid"])))
+            d_load = float(np.linalg.norm(hotspot - np.asarray(result["load_center"])))
+            loc = f"({hotspot[0]:.0f}, {hotspot[1]:.0f}, {hotspot[2]:.0f}) мм"
+            if d_con <= 0.15 * diag:
+                recs.append(f"— Максимум у зоны закрепления, точка {loc}: увеличить площадь опирания, добавить косынки/рёбра жёсткости у опоры, выполнить галтель или местное утолщение в заделке.")
+            elif d_load <= 0.15 * diag:
+                recs.append(f"— Максимум в области приложения нагрузки, точка {loc}: поставить накладку/подкладную пластину и распределить нагрузку на большую площадь (расширить область).")
+            else:
+                recs.append(f"— Максимум в точке {loc} (вдали от опор и нагрузки): местное утолщение стенки или ребро жёсткости вдоль линии «опора → нагрузка» через эту зону.")
+
+    # характер нагружения → тип усиления
+    if analysis_type == "Температурный":
+        recs.append("— Напряжения — от стеснения теплового расширения: усиление сечения НЕ поможет — нужно ослабить закрепление (одна опора неподвижная, остальные скользящие), ввести компенсаторы или взять материал с меньшим α.")
+    elif analysis_type == "Спектральный" and is_fem:
+        if result.get("sigma_spectral", 0.0) >= result.get("sigma_static_part", 0.0):
+            recs.append("— Преобладает сейсмическая составляющая: повысить жёсткость (рёбра, увеличение сечений опор), чтобы увести собственные частоты в зону меньших Sa спектра (см. таблицу «Sa по тонам»); рассмотреть демпферы/дополнительные раскрепления.")
+        else:
+            recs.append("— Преобладает статическая составляющая (НУЭ): усилить несущее сечение в зоне максимума (толщина, рёбра) — см. меры выше.")
+    elif not is_fem and result.get("sigma_bending", 0.0) > result.get("sigma_membrane", 0.0):
+        recs.append(f"— Преобладает изгиб: увеличить высоту сечения/толщину в ≈{np.sqrt(k_need):.2f} раза (W ~ h²), сократить плечо «закрепление → нагрузка» или добавить промежуточную опору.")
+    elif not is_fem:
+        recs.append(f"— Преобладает мембранная составляющая: увеличить площадь несущего сечения в ≈{k_need:.2f} раза (толщина стенки/число опор).")
+
+    # снижение нагрузки как альтернатива
+    contents = float(params.get("contents_mass_kg", 0.0))
+    if contents > 0:
+        recs.append(f"— Либо снизить нагрузку: ограничить массу содержимого (сейчас {contents:.0f} кг) или распределить её ближе к опорам.")
+
+    # альтернативный материал: ближайший по прочности, который проходит без изменения геометрии
+    temperature = float(params.get("temperature", 20.0))
+    candidates = []
+    for mat_name, mat in MATERIALS_GOST.items():
+        sy_t = yield_strength_at_temp(mat, temperature)
+        if sy_t / sigma_total >= norm_eff and sy_t > result["sigma_yield_t"] + 1e-6:
+            candidates.append((sy_t, mat_name))
+    if candidates:
+        sy_t, mat_name = min(candidates)
+        recs.append(f"— Либо материал прочнее: {mat_name} (σт({temperature:.0f} °C) = {sy_t:.0f} МПа) проходит по критерию без изменения геометрии (свойства подтвердить сертификатом).")
+
+    if is_fem and k_need < 1.2:
+        recs.append("— Дефицит запаса небольшой (<20%): сначала проверить сходимость по сетке и локальность максимума (95-й перцентиль) — возможно, это сингулярность и усиление не потребуется.")
+    return recs
+
+
 def get_engineering_recommendations(result, params, norm_coef):
     recs = []
     is_fem = bool(result.get("fem"))
@@ -167,8 +234,10 @@ def get_engineering_recommendations(result, params, norm_coef):
     safety = result["sigma_yield_t"] / sigma_total if sigma_total > 0 else float("inf")
     if safety < 1.0:
         recs.append("Напряжения превышают предел текучести: пересмотреть конструкцию, материал или схему закрепления.")
+        recs.extend(get_reinforcement_recommendations(result, params, norm_coef))
     elif safety < norm_coef:
-        recs.append(f"Запас ниже нормативного n = {norm_coef:g}: уточнить расчёт или снизить нагрузку.")
+        recs.append(f"Запас ниже требуемого n = {norm_coef:g}: уточнить расчёт или усилить конструкцию.")
+        recs.extend(get_reinforcement_recommendations(result, params, norm_coef))
     elif is_fem:
         recs.append("Запас достаточен по КЭ-расчёту; проверить сходимость по сетке (уменьшить размер КЭ и сравнить σmax).")
     else:

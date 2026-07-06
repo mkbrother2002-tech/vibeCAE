@@ -700,6 +700,119 @@ def _extent_along(coords, direction):
     return float(proj.max() - proj.min())
 
 
+def build_scenario_setup_figure(mesh, setup, max_faces=30_000):
+    """Схема сценария на модели: зона закрепления (красный), область нагрузки (оранжевый),
+    стрелки направления нагрузки и гравитации."""
+    if mesh is None:
+        return None
+    coords = mesh.vertices[:, :3]
+    faces = mesh.faces
+    if len(faces) == 0 or len(coords) == 0:
+        return None
+    # упрощаем сетку, чтобы схема не подвешивала вкладку сценариев
+    if len(faces) > max_faces:
+        cache_key = (id(mesh), max_faces)
+        if st.session_state.get('_setup_preview_key') == cache_key:
+            preview = st.session_state.get('_setup_preview_mesh')
+        else:
+            try:
+                preview = mesh.simplify_quadric_decimation(face_count=max_faces)
+                if len(preview.faces) == 0:
+                    preview = None
+            except BaseException:
+                preview = None
+            st.session_state['_setup_preview_key'] = cache_key
+            st.session_state['_setup_preview_mesh'] = preview
+        if preview is not None:
+            mesh = preview
+            coords = mesh.vertices[:, :3]
+            faces = mesh.faces
+        else:
+            # запасной вариант: прореживание треугольников (возможны «дыры» на схеме)
+            faces = faces[np.linspace(0, len(faces) - 1, max_faces).astype(int)]
+    used = np.unique(faces)
+    remap = np.full(len(coords), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    v = coords[used]
+    f = remap[faces]
+
+    fixed_mask, fixed_center = get_constraint_zone(mesh, setup.get("constraint_face"), setup.get("constraint_zone_frac", 0.05))
+    load_mask = get_region_mask(mesh, setup)
+    load_center = get_region_centroid(mesh, load_mask)
+
+    inten = np.zeros(len(coords))
+    inten[load_mask] = 1.0
+    inten[fixed_mask] = 2.0  # закрепление поверх области нагрузки
+
+    colorscale = [
+        [0.0, "#c3c9d1"], [1 / 3, "#c3c9d1"],
+        [1 / 3, "#f5a623"], [2 / 3, "#f5a623"],
+        [2 / 3, "#d0021b"], [1.0, "#d0021b"],
+    ]
+    fig = go.Figure()
+    fig.add_trace(go.Mesh3d(
+        x=v[:, 0], y=v[:, 1], z=v[:, 2],
+        i=f[:, 0], j=f[:, 1], k=f[:, 2],
+        intensity=inten[used], cmin=0.0, cmax=2.0,
+        colorscale=colorscale, showscale=False,
+        flatshading=True, hoverinfo='skip',
+    ))
+
+    diag = float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
+    arrow_len = max(diag * 0.30, 1.0)
+
+    def _surface_tip(center, d, pts):
+        """Сдвигает точку вдоль −d на поверхность тела, чтобы стрелка не пряталась внутри модели."""
+        center = np.asarray(center, dtype=float)
+        proj = pts @ d
+        return center + d * (float(proj.min()) - float(center @ d))
+
+    def _add_arrow(tip, d, color, label):
+        tip = np.asarray(tip, dtype=float)
+        d = np.asarray(d, dtype=float)
+        tail = tip - d * arrow_len
+        fig.add_trace(go.Scatter3d(
+            x=[tail[0], tip[0]], y=[tail[1], tip[1]], z=[tail[2], tip[2]],
+            mode='lines+text', text=[label, ''], textposition='top center',
+            textfont=dict(color=color, size=13),
+            line=dict(color=color, width=7), hoverinfo='skip', showlegend=False,
+        ))
+        fig.add_trace(go.Cone(
+            x=[tip[0]], y=[tip[1]], z=[tip[2]],
+            u=[d[0]], v=[d[1]], w=[d[2]],
+            sizemode='absolute', sizeref=arrow_len * 0.25, anchor='tip',
+            colorscale=[[0, color], [1, color]], showscale=False, hoverinfo='skip',
+        ))
+
+    if setup.get("show_load_arrow", True):
+        d_load = get_direction_vector(setup.get("direction", "-Z"))
+        load_pts = coords[load_mask] if np.any(load_mask) else coords
+        _add_arrow(_surface_tip(load_center, d_load, load_pts), d_load, "#e07b00", "нагрузка")
+    if setup.get("show_gravity_arrow", False):
+        d_g = np.array([0.0, 0.0, -1.0])
+        g_tip = _surface_tip(mesh.centroid, d_g, coords)
+        # разводим со стрелкой нагрузки, если они совпадают
+        g_tip = g_tip + np.array([0.12, 0.0, 0.0]) * diag
+        _add_arrow(g_tip, d_g, "#2b6cb0", "вес")
+
+    # подпись зоны закрепления — с отступом наружу от грани
+    axis_idx, side = CONSTRAINT_FACE_OPTIONS.get(setup.get("constraint_face"), (2, "min"))
+    label_pos = np.asarray(fixed_center, dtype=float).copy()
+    label_pos[axis_idx] += (-1.0 if side == "min" else 1.0) * diag * 0.08
+    fig.add_trace(go.Scatter3d(
+        x=[label_pos[0]], y=[label_pos[1]], z=[label_pos[2]],
+        mode='text', text=['закрепление'], textposition='middle center',
+        textfont=dict(color="#d0021b", size=13), hoverinfo='skip', showlegend=False,
+    ))
+
+    fig.update_layout(
+        scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'),
+        margin=dict(l=0, r=0, b=0, t=10),
+        height=420,
+    )
+    return fig
+
+
 def estimate_first_frequency_hz(mesh, material_data, mass_props, total_mass_kg, constraint_centroid, constraint_type):
     """Оценка первой собственной частоты по балочной модели (метод Рэлея).
 
@@ -1176,6 +1289,36 @@ with tab2:
                         max(diag / 200.0, 0.1), max(diag, 1.0), max(diag / 10.0, 0.5),
                         key=f"region_radius_{scenario}",
                     )
+
+                mesh_preview = st.session_state.get('active_mesh')
+                if mesh_preview is None:
+                    mesh_preview = st.session_state.get('stl_mesh')
+                if mesh_preview is None:
+                    st.info("Схема закреплений и нагрузок появится после загрузки модели на вкладке 1.")
+                elif st.toggle(f"Схема закреплений и нагрузок ({scenario[:20]}...)", value=True, key=f"setup_viz_{scenario}"):
+                    setup = {
+                        "constraint_face": st.session_state.get(f"constraint_face_{scenario}", list(CONSTRAINT_FACE_OPTIONS.keys())[0]),
+                        "constraint_zone_frac": float(st.session_state.get(f"constraint_zone_{scenario}", 5)) / 100.0,
+                        "region_mode": region_mode,
+                        "direction": st.session_state.get(f"direction_{scenario}", preset["default_direction"]),
+                        "show_gravity_arrow": bool(st.session_state.get(f"gravity_{scenario}", True)),
+                    }
+                    if region_mode == "Пользовательская область":
+                        setup["region_axis"] = st.session_state.get(f"region_axis_{scenario}", "Z")
+                        rng = st.session_state.get(f"region_range_{scenario}")
+                        if rng is not None:
+                            setup["region_min"], setup["region_max"] = float(rng[0]), float(rng[1])
+                    elif region_mode == "Точка с радиусом":
+                        setup["selection_points"] = [[
+                            float(st.session_state.get(f"region_px_{scenario}", 0.0)),
+                            float(st.session_state.get(f"region_py_{scenario}", 0.0)),
+                            float(st.session_state.get(f"region_pz_{scenario}", 0.0)),
+                        ]]
+                        setup["selection_radius"] = float(st.session_state.get(f"region_radius_{scenario}", 1.0))
+                    fig_setup = build_scenario_setup_figure(mesh_preview, setup)
+                    if fig_setup is not None:
+                        st.plotly_chart(fig_setup, key=f"setup_chart_{scenario}")
+                        st.caption("🔴 зона закрепления | 🟠 область приложения силы/давления | стрелка «нагрузка» — направление силы/сейсмики, «вес» — гравитация")
 
     if st.button("Сформировать набор сценариев", type="primary"):
         st.session_state['selected_scenarios'] = selected_scenarios

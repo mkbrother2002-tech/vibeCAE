@@ -638,14 +638,14 @@ def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, use
         passed = row.get("passed")
         vcolor = GOOD if passed else (BAD if passed is not None else GREY)
         story.append(Paragraph(
-            f"Вердикт: {esc(row.get('verdict', '—'))}",
+            f"Заключение: {esc(row.get('verdict', '—'))}",
             ParagraphStyle('Verdict', parent=body, fontName=font_b, textColor=vcolor, spaceBefore=4)))
         if row.get("image_png"):
             story.extend(fig_flowables(row["image_png"], f"Поле напряжений, сценарий «{row['scenario']}»"))
 
     # ===== 5. Сводная таблица =====
     story.append(Paragraph("5. СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ", h1))
-    head = ["Сценарий", "Тип расчёта", "T, °C", "Результат", "Допускаемое", "Запас", "Вердикт"]
+    head = ["Сценарий", "Тип расчёта", "T, °C", "Результат", "Допускаемое", "Запас", "Заключение"]
     summary_data = [[Paragraph(x, cell_hdr) for x in head]]
     summary_style = [
         ('GRID', (0, 0), (-1, -1), 0.4, RULE),
@@ -669,7 +669,7 @@ def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, use
         ])
         if r_i % 2 == 0:
             summary_style.append(('BACKGROUND', (0, r_i), (-1, r_i), ROW_ALT))
-    summary_t = Table(summary_data, colWidths=[c * mm for c in (42, 24, 11, 25, 30, 15, 27)], repeatRows=1)
+    summary_t = Table(summary_data, colWidths=[c * mm for c in (38, 24, 11, 25, 30, 15, 31)], repeatRows=1)
     summary_t.setStyle(TableStyle(summary_style))
     story.append(summary_t)
     story.append(Paragraph(f"Таблица {tbl_no} — Сводные результаты оценки прочности", caption))
@@ -2084,7 +2084,7 @@ with tab3:
                                     "result_text": f"{sigma_total:.1f} МПа",
                                     "allow_text": f"{sigma_allow:.1f} МПа" + (f" ({params['seism_combo']})" if allow_k > 1.0 else ""),
                                     "safety_text": f"{safety_factor:.2f}" if np.isfinite(safety_factor) else "∞",
-                                    "verdict": "Пройдён" if safety_factor >= norm_eff else "Не пройдён",
+                                    "verdict": "Соответствует требованиям" if safety_factor >= norm_eff else "Не соответствует требованиям",
                                     "safety_sort": safety_factor,
                                     "passed": bool(safety_factor >= norm_eff),
                                 }

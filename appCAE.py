@@ -11,10 +11,19 @@ from io import BytesIO
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (
+        BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer,
+        Table, TableStyle, Image as RLImage, PageBreak, NextPageTemplate,
+        HRFlowable,
+    )
+    from reportlab.platypus.tableofcontents import TableOfContents
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -262,24 +271,39 @@ def get_engineering_recommendations(result, params, norm_coef):
     return recs
 
 
-def _pick_pdf_font_name():
+def _register_pdf_fonts():
+    """Регистрирует пару шрифтов (обычный + жирный) с поддержкой кириллицы."""
     if not REPORTLAB_AVAILABLE:
-        return None
+        return None, None
 
-    candidates = [
-        "fonts/DejaVuSans.ttf",
+    pairs = [
+        ("fonts/DejaVuSans.ttf", "fonts/DejaVuSans-Bold.ttf"),
+        ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        ("/Library/Fonts/Arial.ttf", "/Library/Fonts/Arial Bold.ttf"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ]
+    for regular, bold in pairs:
+        if os.path.exists(regular):
+            try:
+                pdfmetrics.registerFont(TTFont("AppFont", regular))
+                if os.path.exists(bold):
+                    pdfmetrics.registerFont(TTFont("AppFont-Bold", bold))
+                    return "AppFont", "AppFont-Bold"
+                return "AppFont", "AppFont"
+            except Exception:
+                continue
+    singles = [
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
     ]
-    for path in candidates:
+    for path in singles:
         if os.path.exists(path):
             try:
                 pdfmetrics.registerFont(TTFont("AppFont", path))
-                return "AppFont"
+                return "AppFont", "AppFont"
             except Exception:
                 continue
-    return "Helvetica"
+    return "Helvetica", "Helvetica-Bold"
 
 
 def build_nds_preview_png(coords, stress, scenario_name):
@@ -308,110 +332,269 @@ def build_nds_preview_png(coords, stress, scenario_name):
         return None
 
 
-def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, preview_png=None, use_fem=False):
+def build_model_view_png(mesh):
+    """Общий вид расчётной модели (серый Mesh3d) для раздела «Исходные данные»."""
+    try:
+        if mesh is None:
+            return None
+        verts, faces = mesh.vertices, mesh.faces
+        if len(faces) > 60_000:
+            try:
+                mesh_s = mesh.simplify_quadric_decimation(face_count=60_000)
+                verts, faces = mesh_s.vertices, mesh_s.faces
+            except Exception:
+                pass
+        fig = go.Figure(go.Mesh3d(
+            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color='lightsteelblue', flatshading=True,
+            lighting=dict(ambient=0.45, diffuse=0.8, specular=0.15),
+        ))
+        fig.update_layout(
+            scene=dict(xaxis_title='X, мм', yaxis_title='Y, мм', zaxis_title='Z, мм', aspectmode='data'),
+            margin=dict(l=0, r=0, b=0, t=10),
+            paper_bgcolor='white',
+        )
+        return pio.to_image(fig, format="png", width=1100, height=700, scale=2)
+    except Exception:
+        return None
+
+
+def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, use_fem=False,
+                           material=None, model_info=None, model_png=None):
+    """Формирует формальный научно-технический отчёт (титул, оглавление, разделы, колонтитулы)."""
     if not REPORTLAB_AVAILABLE:
         return None
 
-    font_name = _pick_pdf_font_name()
-    pdf_buffer = BytesIO()
-    pdf = canvas.Canvas(pdf_buffer, pagesize=A4)
-    _, height = A4
+    import html as _html
 
-    # Титульный лист
-    y = height - 30 * mm
-    pdf.setFont(font_name, 18)
-    pdf.drawString(20 * mm, y, "VibeCAE")
-    y -= 10 * mm
+    def esc(text):
+        return _html.escape(str(text))
 
-    pdf.setFont(font_name, 14)
-    pdf.drawString(20 * mm, y, "Научно-технический отчет по экспресс-оценке прочности")
-    y -= 12 * mm
+    font, font_b = _register_pdf_fonts()
+    now = datetime.now()
+    doc_no = f"VCAE-{now.strftime('%Y%m%d-%H%M')}"
 
-    pdf.setFont(font_name, 11)
-    pdf.drawString(20 * mm, y, f"Дата формирования: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    y -= 7 * mm
-    pdf.drawString(20 * mm, y, f"Материал: {material_name}")
-    y -= 7 * mm
-    pdf.drawString(20 * mm, y, f"Норма запаса: {norm_name} (n = {norm_coef:g})")
-    y -= 7 * mm
-    pdf.drawString(20 * mm, y, f"Количество сценариев: {len(report_rows)}")
-    y -= 12 * mm
-    pdf.setFont(font_name, 10)
-    if use_fem:
-        pdf.drawString(20 * mm, y, "Расчёт выполнен методом конечных элементов (CalculiX, тетраэдры C3D10 2-го порядка).")
-    else:
-        pdf.drawString(20 * mm, y, "Оценка выполнена аналитическими формулами (без КЭ-решателя) и носит предварительный характер.")
+    ACCENT = colors.HexColor("#1F3864")
+    ACCENT_LIGHT = colors.HexColor("#D9E2F3")
+    RULE = colors.HexColor("#8496B0")
+    GREY = colors.HexColor("#5B6B8C")
+    GOOD = colors.HexColor("#1E7B34")
+    BAD = colors.HexColor("#B02A2A")
+    ROW_ALT = colors.HexColor("#F2F5FA")
 
-    pdf.showPage()
+    body = ParagraphStyle('Body', fontName=font, fontSize=10, leading=14.5, alignment=TA_JUSTIFY, spaceAfter=4)
+    caption = ParagraphStyle('Caption', fontName=font, fontSize=9, leading=12, alignment=TA_CENTER,
+                             textColor=GREY, spaceBefore=3, spaceAfter=10)
+    h1 = ParagraphStyle('H1', fontName=font_b, fontSize=14, leading=18, textColor=ACCENT, spaceBefore=16, spaceAfter=8)
+    h2 = ParagraphStyle('H2', fontName=font_b, fontSize=11.5, leading=15, textColor=ACCENT, spaceBefore=12, spaceAfter=6)
+    cell = ParagraphStyle('Cell', fontName=font, fontSize=8.5, leading=11)
+    cell_b = ParagraphStyle('CellB', fontName=font_b, fontSize=8.5, leading=11)
+    cell_hdr = ParagraphStyle('CellHdr', fontName=font_b, fontSize=8.5, leading=11, textColor=colors.white)
+    rec_head = ParagraphStyle('RecHead', parent=body, fontName=font_b, spaceBefore=6)
+    rec_item = ParagraphStyle('RecItem', parent=body, leftIndent=6 * mm, spaceAfter=3)
 
-    y = height - 20 * mm
-    pdf.setFont(font_name, 14)
-    pdf.drawString(20 * mm, y, "Сводная таблица результатов")
-    y -= 8 * mm
+    class _ReportDoc(BaseDocTemplate):
+        def afterFlowable(self, flowable):
+            if isinstance(flowable, Paragraph):
+                sname = flowable.style.name
+                if sname == 'H1':
+                    self.notify('TOCEntry', (0, flowable.getPlainText(), self.page))
+                elif sname == 'H2':
+                    self.notify('TOCEntry', (1, flowable.getPlainText(), self.page))
 
-    pdf.setFont(font_name, 10)
-    pdf.drawString(20 * mm, y, f"Материал: {material_name} | [σ] = σт(T) / {norm_coef:g}")
-    y -= 10 * mm
+    page_w, page_h = A4
 
-    headers = ["Сценарий", "Тип", "T,°C", "Результат", "Допуск", "Запас", "Вердикт"]
-    cols_mm = [20, 74, 100, 110, 138, 162, 174]
+    def _decorate(canv, doc_):
+        canv.saveState()
+        canv.setStrokeColor(RULE)
+        canv.setLineWidth(0.6)
+        canv.line(18 * mm, page_h - 14 * mm, page_w - 18 * mm, page_h - 14 * mm)
+        canv.setFont(font, 7.5)
+        canv.setFillColor(GREY)
+        canv.drawString(18 * mm, page_h - 12.5 * mm, "VibeCAE — расчётное обоснование прочности")
+        canv.drawRightString(page_w - 18 * mm, page_h - 12.5 * mm, doc_no)
+        canv.line(18 * mm, 14 * mm, page_w - 18 * mm, 14 * mm)
+        canv.drawString(18 * mm, 10 * mm, now.strftime("%d.%m.%Y"))
+        canv.drawRightString(page_w - 18 * mm, 10 * mm, f"Лист {doc_.page}")
+        canv.restoreState()
 
-    pdf.setFont(font_name, 9)
-    for label, x in zip(headers, cols_mm):
-        pdf.drawString(x * mm, y, label)
-    y -= 4 * mm
-    pdf.line(20 * mm, y, 200 * mm, y)
-    y -= 5 * mm
+    buf = BytesIO()
+    doc = _ReportDoc(buf, pagesize=A4, title="VibeCAE — расчётное обоснование прочности", author="VibeCAE")
+    frame_cover = Frame(18 * mm, 18 * mm, page_w - 36 * mm, page_h - 36 * mm, id='cover')
+    frame_main = Frame(18 * mm, 20 * mm, page_w - 36 * mm, page_h - 38 * mm, id='main')
+    doc.addPageTemplates([
+        PageTemplate(id='Cover', frames=[frame_cover]),
+        PageTemplate(id='Main', frames=[frame_main], onPage=_decorate),
+    ])
 
-    for row in report_rows:
-        if y < 20 * mm:
-            pdf.showPage()
-            pdf.setFont(font_name, 9)
-            y = height - 20 * mm
+    def kv_table(rows, col1=64, col2=110):
+        data = [[Paragraph(esc(k), cell_b), Paragraph(esc(v), cell)] for k, v in rows]
+        table = Table(data, colWidths=[col1 * mm, col2 * mm])
+        table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.4, RULE),
+            ('BACKGROUND', (0, 0), (0, -1), ACCENT_LIGHT),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('LEFTPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        return table
 
-        pdf.drawString(20 * mm, y, str(row["scenario"])[:32])
-        pdf.drawString(74 * mm, y, str(row["analysis_type"])[:13])
-        pdf.drawRightString(107 * mm, y, f"{row['temperature']}")
-        pdf.drawString(110 * mm, y, str(row["result_text"])[:16])
-        pdf.drawString(138 * mm, y, str(row["allow_text"])[:14])
-        pdf.drawRightString(171 * mm, y, str(row["safety_text"]))
-        pdf.drawString(174 * mm, y, str(row["verdict"])[:18])
-        y -= 5 * mm
+    fig_no = 1
+    tbl_no = 1
 
-    y -= 2 * mm
-    pdf.line(20 * mm, y, 200 * mm, y)
-    y -= 7 * mm
-
-    finite_rows = [r for r in report_rows if np.isfinite(r.get("safety_sort", float("inf")))]
-    if finite_rows:
-        worst = min(finite_rows, key=lambda r: r["safety_sort"])
-        pdf.setFont(font_name, 10)
-        pdf.drawString(20 * mm, y, f"Критичный сценарий: {worst['scenario'][:70]}")
-        y -= 6 * mm
-        pdf.drawString(20 * mm, y, f"Минимальный запас прочности: {worst['safety_text']} (норматив n = {norm_coef:g})")
-
-    if preview_png is not None:
-        y -= 12 * mm
-        if y < 95 * mm:
-            pdf.showPage()
-            y = height - 20 * mm
-        pdf.setFont(font_name, 11)
-        pdf.drawString(20 * mm, y, "Оценочное распределение напряжений для критичного сценария")
-        y -= 5 * mm
+    def fig_flowables(png_bytes, caption_text, width_mm=148, height_mm=94):
+        nonlocal fig_no
+        out = []
         try:
-            image = ImageReader(BytesIO(preview_png))
-            pdf.drawImage(image, 20 * mm, y - 85 * mm, width=170 * mm, height=85 * mm, preserveAspectRatio=True, anchor='n')
+            img = RLImage(BytesIO(png_bytes), width=width_mm * mm, height=height_mm * mm)
+            out.append(Spacer(1, 3 * mm))
+            out.append(img)
+            out.append(Paragraph(f"Рисунок {fig_no} — {esc(caption_text)}", caption))
+            fig_no += 1
         except Exception:
-            pdf.setFont(font_name, 9)
-            pdf.drawString(20 * mm, y, "Не удалось встроить изображение карты НДС в PDF.")
+            pass
+        return out
 
-    # Методика и допущения
-    pdf.showPage()
-    y = height - 20 * mm
-    pdf.setFont(font_name, 14)
-    pdf.drawString(20 * mm, y, "Методика и допущения")
-    y -= 10 * mm
-    pdf.setFont(font_name, 10)
+    story = []
+
+    # ===== Титульный лист =====
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph(
+        "АВТОМАТИЗИРОВАННАЯ СИСТЕМА ИНЖЕНЕРНОГО АНАЛИЗА «VIBECAE»",
+        ParagraphStyle('CoverOrg', fontName=font_b, fontSize=10.5, alignment=TA_CENTER, textColor=GREY)))
+    story.append(Spacer(1, 2.5 * mm))
+    story.append(HRFlowable(width="100%", thickness=1.2, color=ACCENT))
+    story.append(Spacer(1, 42 * mm))
+    story.append(Paragraph(
+        "РАСЧЁТНОЕ ОБОСНОВАНИЕ ПРОЧНОСТИ",
+        ParagraphStyle('CoverTitle', fontName=font_b, fontSize=21, leading=26, alignment=TA_CENTER, textColor=ACCENT)))
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph("Научно-технический отчёт",
+                           ParagraphStyle('CoverSub', fontName=font, fontSize=13, alignment=TA_CENTER)))
+    story.append(Spacer(1, 4 * mm))
+    story.append(Paragraph(f"№ {doc_no}",
+                           ParagraphStyle('CoverNo', fontName=font, fontSize=11, alignment=TA_CENTER, textColor=GREY)))
+    story.append(Spacer(1, 12 * mm))
+    obj_name = (model_info or {}).get("file") or "3D-модель"
+    cover_info = ParagraphStyle('CoverInfo', fontName=font, fontSize=10.5, leading=16, alignment=TA_CENTER)
+    story.append(Paragraph(f"Объект расчёта: {esc(obj_name)}", cover_info))
+    story.append(Paragraph(f"Материал: {esc(material_name)}", cover_info))
+    story.append(Paragraph(f"Нормативная база: {esc(norm_name)} (n = {norm_coef:g})", cover_info))
+    story.append(Paragraph(
+        "Метод расчёта: метод конечных элементов (CalculiX)" if use_fem
+        else "Метод расчёта: аналитическая экспресс-оценка", cover_info))
+    story.append(Spacer(1, 28 * mm))
+    sig_cell = ParagraphStyle('SigCell', fontName=font, fontSize=10, leading=13)
+    date_blank = f"«___» ____________ {now.year} г."
+    sig_data = [
+        [Paragraph(role, sig_cell), Paragraph("_________________", sig_cell), Paragraph(date_blank, sig_cell)]
+        for role in ("Разработал", "Проверил", "Утвердил")
+    ]
+    sig_t = Table(sig_data, colWidths=[42 * mm, 62 * mm, 62 * mm])
+    sig_t.setStyle(TableStyle([
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(sig_t)
+    story.append(Spacer(1, 22 * mm))
+    story.append(Paragraph(now.strftime("Дата формирования: %d.%m.%Y %H:%M"),
+                           ParagraphStyle('CoverDate', fontName=font, fontSize=10, alignment=TA_CENTER, textColor=GREY)))
+    story.append(NextPageTemplate('Main'))
+    story.append(PageBreak())
+
+    # ===== Содержание =====
+    story.append(Paragraph("СОДЕРЖАНИЕ",
+                           ParagraphStyle('TOCTitle', fontName=font_b, fontSize=14, alignment=TA_CENTER,
+                                          textColor=ACCENT, spaceAfter=10)))
+    toc = TableOfContents()
+    toc.levelStyles = [
+        ParagraphStyle('TOCL0', fontName=font_b, fontSize=10.5, leading=15, leftIndent=6, firstLineIndent=-6, spaceBefore=5),
+        ParagraphStyle('TOCL1', fontName=font, fontSize=9.5, leading=13, leftIndent=16, firstLineIndent=-6),
+    ]
+    story.append(toc)
+    story.append(PageBreak())
+
+    # ===== 1. Введение =====
+    story.append(Paragraph("1. ВВЕДЕНИЕ", h1))
+    method_intro = (
+        "методом конечных элементов (решатель CalculiX, сетка второго порядка C3D10, построенная средствами gmsh "
+        "из исходной STEP-геометрии)" if use_fem
+        else "аналитическими инженерными методами (экспресс-оценка мембранных, изгибных и температурных напряжений)")
+    story.append(Paragraph(
+        f"Настоящий отчёт содержит результаты расчётного обоснования прочности объекта "
+        f"«{esc(obj_name)}». Расчёты выполнены {method_intro} в автоматизированной системе инженерного "
+        f"анализа VibeCAE.", body))
+    story.append(Paragraph(
+        f"Всего рассмотрено расчётных случаев (сценариев нагружения): {len(report_rows)}. "
+        f"Оценка прочности выполнена по критерию текучести в соответствии с нормативным документом "
+        f"«{esc(norm_name)}» с коэффициентом запаса n = {norm_coef:g}.", body))
+    story.append(Paragraph(
+        "Отчёт сформирован автоматически и подлежит проверке квалифицированным инженером-расчётчиком. "
+        "Исходные данные (свойства материала, нагрузки, граничные условия) приведены в разделе 2, "
+        "методика и допущения — в разделе 3, результаты по сценариям — в разделе 4, "
+        "сводная таблица, рекомендации и заключение — в разделах 5–7.", body))
+
+    # ===== 2. Исходные данные =====
+    story.append(Paragraph("2. ИСХОДНЫЕ ДАННЫЕ", h1))
+    story.append(Paragraph("2.1. Объект расчёта", h2))
+    if model_info and model_info.get("rows"):
+        story.append(kv_table(model_info["rows"]))
+        story.append(Paragraph(f"Таблица {tbl_no} — Характеристики расчётной модели", caption))
+        tbl_no += 1
+    if model_png:
+        story.extend(fig_flowables(model_png, "Общий вид расчётной модели"))
+
+    story.append(Paragraph("2.2. Материал", h2))
+    if material:
+        mat_rows = [
+            ("Марка", material_name),
+            ("Назначение", material.get("desc", "—")),
+            ("Предел текучести σт (20 °C)", f"{material['yield_strength']} МПа"),
+            ("Модуль упругости E", f"{material['elastic_modulus']} ГПа"),
+            ("Плотность ρ", f"{material['density']} кг/м³"),
+            ("Коэффициент Пуассона μ", f"{material['poisson']:g}"),
+            ("КЛТР α", f"{material['thermal_expansion'] * 1e6:.1f} мкм/(м·°C)"),
+        ]
+        story.append(kv_table(mat_rows))
+        story.append(Paragraph(f"Таблица {tbl_no} — Физико-механические свойства материала (справочные)", caption))
+        tbl_no += 1
+        curve = material.get("yield_temp_curve") or {}
+        if curve:
+            temps = sorted(curve)
+            col_w = min(20.0, 148.0 / max(len(temps), 1))
+            curve_data = [
+                [Paragraph("T, °C", cell_hdr)] + [Paragraph(str(t), cell) for t in temps],
+                [Paragraph("σт, МПа", cell_hdr)] + [Paragraph(f"{curve[t]:g}", cell) for t in temps],
+            ]
+            curve_t = Table(curve_data, colWidths=[26 * mm] + [col_w * mm] * len(temps))
+            curve_t.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 0.4, RULE),
+                ('BACKGROUND', (0, 0), (0, -1), ACCENT),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ]))
+            story.append(curve_t)
+            story.append(Paragraph(f"Таблица {tbl_no} — Снижение предела текучести с температурой", caption))
+            tbl_no += 1
+    story.append(Paragraph(
+        "Свойства материала приняты по справочным данным и подлежат уточнению по сертификату "
+        "на конкретную партию металла и действующим нормам.", body))
+
+    story.append(Paragraph("2.3. Нормативные требования", h2))
+    story.append(Paragraph(
+        f"Допускаемые напряжения определены по критерию текучести: [σ] = σт(T) / n, "
+        f"где n = {norm_coef:g} — коэффициент запаса по нормам «{esc(norm_name)}», "
+        f"σт(T) — предел текучести при расчётной температуре.", body))
+    story.append(Paragraph(
+        "Для сейсмических сочетаний нагрузок в соответствии с подходом ПНАЭ Г-7-002-86 допускаемые "
+        "напряжения повышаются: для сочетания НУЭ+ПЗ — в 1.2 раза, для сочетания НУЭ+МРЗ — в 1.4 раза. "
+        f"Типовой диапазон частот сейсмического возбуждения принят {SEISMIC_BAND_HZ[0]:g}–{SEISMIC_BAND_HZ[1]:g} Гц.", body))
+
+    # ===== 3. Методика =====
+    story.append(Paragraph("3. МЕТОДИКА РАСЧЁТА И ДОПУЩЕНИЯ", h1))
     if use_fem:
         methodology_lines = [
             "1. Расчёт выполнен методом конечных элементов: решатель CalculiX, сетка gmsh из STEP-геометрии.",
@@ -439,17 +622,115 @@ def build_pdf_report_bytes(material_name, norm_name, norm_coef, report_rows, pre
             "10. Результаты предназначены для предварительной оценки и не заменяют поверочный расчёт по КЭ-модели.",
         ]
     for line in methodology_lines:
-        if y < 20 * mm:
-            pdf.showPage()
-            pdf.setFont(font_name, 10)
-            y = height - 20 * mm
-        pdf.drawString(20 * mm, y, line)
-        y -= 6 * mm
+        story.append(Paragraph(esc(line), body))
 
-    pdf.showPage()
-    pdf.save()
-    pdf_buffer.seek(0)
-    return pdf_buffer.getvalue()
+    # ===== 4. Результаты по сценариям =====
+    story.append(Paragraph("4. РЕЗУЛЬТАТЫ РАСЧЁТОВ", h1))
+    for i, row in enumerate(report_rows, start=1):
+        story.append(Paragraph(f"4.{i}. Сценарий «{esc(row['scenario'])}»", h2))
+        if row.get("params_rows"):
+            story.append(Paragraph("Расчётный случай и граничные условия:", body))
+            story.append(kv_table(row["params_rows"]))
+            story.append(Paragraph(f"Таблица {tbl_no} — Параметры сценария «{esc(row['scenario'])}»", caption))
+            tbl_no += 1
+        for detail in row.get("details", []):
+            story.append(Paragraph(esc(detail), body))
+        passed = row.get("passed")
+        vcolor = GOOD if passed else (BAD if passed is not None else GREY)
+        story.append(Paragraph(
+            f"Вердикт: {esc(row.get('verdict', '—'))}",
+            ParagraphStyle('Verdict', parent=body, fontName=font_b, textColor=vcolor, spaceBefore=4)))
+        if row.get("image_png"):
+            story.extend(fig_flowables(row["image_png"], f"Поле напряжений, сценарий «{row['scenario']}»"))
+
+    # ===== 5. Сводная таблица =====
+    story.append(Paragraph("5. СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ", h1))
+    head = ["Сценарий", "Тип расчёта", "T, °C", "Результат", "Допускаемое", "Запас", "Вердикт"]
+    summary_data = [[Paragraph(x, cell_hdr) for x in head]]
+    summary_style = [
+        ('GRID', (0, 0), (-1, -1), 0.4, RULE),
+        ('BACKGROUND', (0, 0), (-1, 0), ACCENT),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 3.5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3.5),
+    ]
+    for r_i, row in enumerate(report_rows, start=1):
+        passed = row.get("passed")
+        vstyle = ParagraphStyle('SumVerdict', parent=cell_b,
+                                textColor=GOOD if passed else (BAD if passed is not None else GREY))
+        summary_data.append([
+            Paragraph(esc(row["scenario"]), cell),
+            Paragraph(esc(row["analysis_type"]), cell),
+            Paragraph(str(row["temperature"]), cell),
+            Paragraph(esc(row["result_text"]), cell),
+            Paragraph(esc(row["allow_text"]), cell),
+            Paragraph(esc(row["safety_text"]), cell),
+            Paragraph(esc(row["verdict"]), vstyle),
+        ])
+        if r_i % 2 == 0:
+            summary_style.append(('BACKGROUND', (0, r_i), (-1, r_i), ROW_ALT))
+    summary_t = Table(summary_data, colWidths=[c * mm for c in (42, 24, 11, 25, 30, 15, 27)], repeatRows=1)
+    summary_t.setStyle(TableStyle(summary_style))
+    story.append(summary_t)
+    story.append(Paragraph(f"Таблица {tbl_no} — Сводные результаты оценки прочности", caption))
+    tbl_no += 1
+
+    finite_rows = [r for r in report_rows if np.isfinite(r.get("safety_sort", float("inf")))]
+    worst = min(finite_rows, key=lambda r: r["safety_sort"]) if finite_rows else None
+    if worst is not None:
+        story.append(Paragraph(
+            f"Определяющим (критичным) является сценарий «{esc(worst['scenario'])}»: "
+            f"минимальный запас прочности по пределу текучести составляет {esc(worst['safety_text'])} "
+            f"при нормативном значении n = {norm_coef:g}.", body))
+
+    # ===== 6. Рекомендации =====
+    story.append(Paragraph("6. РЕКОМЕНДАЦИИ", h1))
+    any_recs = False
+    for row in report_rows:
+        recs = row.get("recommendations") or []
+        if not recs:
+            continue
+        any_recs = True
+        story.append(Paragraph(f"Сценарий «{esc(row['scenario'])}»:", rec_head))
+        for rec in recs:
+            story.append(Paragraph(f"— {esc(rec)}", rec_item))
+    if not any_recs:
+        story.append(Paragraph(
+            "По результатам выполненных расчётов прочность конструкции обеспечена во всех рассмотренных "
+            "сценариях; дополнительных мероприятий по усилению конструкции не требуется.", body))
+
+    # ===== 7. Заключение =====
+    story.append(Paragraph("7. ЗАКЛЮЧЕНИЕ", h1))
+    checked = [r for r in report_rows if r.get("passed") is not None]
+    n_pass = sum(1 for r in checked if r["passed"])
+    n_fail = len(checked) - n_pass
+    if checked:
+        if n_fail == 0:
+            concl = (f"По результатам расчётов все проверенные по напряжениям сценарии ({len(checked)} шт.) "
+                     f"удовлетворяют критерию прочности [σ] = σт(T)/n при n = {norm_coef:g}. "
+                     "Прочность конструкции в рассмотренных расчётных случаях обеспечена.")
+        else:
+            concl = (f"По результатам расчётов критерий прочности выполнен в {n_pass} из {len(checked)} "
+                     f"проверенных по напряжениям сценариев; в {n_fail} сценариях критерий не выполнен. "
+                     "Требуется доработка конструкции в соответствии с рекомендациями раздела 6 "
+                     "и повторный поверочный расчёт.")
+        story.append(Paragraph(concl, body))
+    modal_rows = [r for r in report_rows if r.get("passed") is None]
+    if modal_rows:
+        story.append(Paragraph(
+            f"Дополнительно выполнены модальные оценки ({len(modal_rows)} шт.); результаты проверки на попадание "
+            f"первой собственной частоты в сейсмический диапазон {SEISMIC_BAND_HZ[0]:g}–{SEISMIC_BAND_HZ[1]:g} Гц "
+            "приведены в разделах 4 и 5.", body))
+    story.append(Paragraph(
+        "Настоящий отчёт сформирован автоматизированной системой VibeCAE. "
+        + ("Расчёт выполнен методом конечных элементов в линейно-упругой постановке; результаты действительны "
+           "в пределах принятых допущений (раздел 3)." if use_fem
+           else "Результаты получены экспресс-методом и предназначены для предварительной оценки; "
+                "они не заменяют поверочный расчёт по конечно-элементной модели."), body))
+
+    doc.multiBuild(story)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def load_step_to_trimesh(file_bytes, linear_deflection=0.5):
@@ -1712,53 +1993,137 @@ with tab3:
             st.markdown("---")
             if REPORTLAB_AVAILABLE:
                 if st.button("Сформировать PDF-отчет", width='stretch'):
-                    report_rows = []
-                    worst_case = None
-                    for scenario, params, result, field in scenario_results:
-                        if result["analysis_type"] == "Модальный":
-                            f1 = result["first_frequency_hz"]
-                            in_band = f1 is not None and SEISMIC_BAND_HZ[0] <= f1 <= SEISMIC_BAND_HZ[1]
-                            row = {
-                                "scenario": scenario,
-                                "analysis_type": result["analysis_type"],
-                                "temperature": params['temperature'],
-                                "result_text": f"f1 = {f1:.1f} Гц" if f1 is not None else "f1: н/д",
-                                "allow_text": "вне 0.5-33 Гц",
-                                "safety_text": "—",
-                                "verdict": "Возможен резонанс" if in_band else "Резонанс маловероятен",
-                                "safety_sort": float("inf"),
-                            }
-                        else:
-                            sigma_total = result["sigma_total"]
-                            safety_factor = result["sigma_yield_t"] / sigma_total if sigma_total > 0 else float("inf")
+                    with st.spinner("Формирование PDF-отчета (генерация иллюстраций)..."):
+                        report_rows = []
+                        for scenario, params, result, field in scenario_results:
                             allow_k = float(params.get("allow_factor", 1.0))
                             norm_eff = norm_coef / allow_k
-                            sigma_allow = result["sigma_yield_t"] / norm_eff
-                            row = {
-                                "scenario": scenario,
-                                "analysis_type": result["analysis_type"],
-                                "temperature": params['temperature'],
-                                "result_text": f"{sigma_total:.1f} МПа",
-                                "allow_text": f"{sigma_allow:.1f} МПа" + (f" ({params['seism_combo']})" if allow_k > 1.0 else ""),
-                                "safety_text": f"{safety_factor:.2f}" if np.isfinite(safety_factor) else "∞",
-                                "verdict": "Пройдён" if safety_factor >= norm_eff else "Не пройдён",
-                                "safety_sort": safety_factor,
-                            }
-                        report_rows.append(row)
 
-                        if row["safety_sort"] != float("inf") and (worst_case is None or row["safety_sort"] < worst_case["safety_sort"]):
-                            worst_case = {"scenario": scenario, "safety_sort": row["safety_sort"]}
+                            params_rows = [
+                                ("Тип расчёта", result["analysis_type"]),
+                                ("Температура", f"{params['temperature']} °C"),
+                                ("Тип нагружения", params.get("load_type", "—")),
+                                ("Направление воздействия", params.get("direction", "—")),
+                                ("Собственный вес", "учитывается" if params.get("include_gravity") else "не учитывается"),
+                            ]
+                            if float(params.get("contents_mass_kg", 0.0)) > 0:
+                                params_rows.append(("Масса содержимого", f"{params['contents_mass_kg']:g} кг"))
+                            if float(params.get("point_force_n", 0.0)) > 0:
+                                params_rows.append(("Сосредоточенная сила", f"{params['point_force_n']:g} Н"))
+                            if float(params.get("pressure_mpa", 0.0)) > 0:
+                                params_rows.append(("Давление", f"{params['pressure_mpa']:g} МПа"))
+                            if float(params.get("seismic_g", 0.0)) > 0:
+                                params_rows.append(("Сейсмическое ускорение", f"{params['seismic_g']:g} g"))
+                            if params.get("seism_combo"):
+                                params_rows.append(("Сочетание нагрузок", f"{params['seism_combo']} ([σ]×{allow_k:g})"))
+                            params_rows.extend([
+                                ("Закрепление", f"{params.get('constraint_face', '—')}, {str(params.get('constraint_type', '—')).lower()}"),
+                                ("Зона закрепления", f"{params.get('constraint_zone_frac', 0.05) * 100:.0f} % габарита"),
+                                ("Область приложения нагрузки", params.get("region_mode", "Автоматическая зона")),
+                            ])
 
-                    with st.spinner("Формирование PDF-отчета..."):
-                        preview_png = None
-                        if worst_case is not None:
-                            for scenario, _, result, field in scenario_results:
-                                if scenario == worst_case["scenario"]:
-                                    preview_coords = result["viz_coords"] if result.get("fem") else coords
-                                    preview_png = build_nds_preview_png(preview_coords, field, scenario)
-                                    break
+                            details = []
+                            mp = result.get("mass_props") or {}
+                            if mp.get("mass_kg"):
+                                details.append(f"Масса конструкции: {mp['mass_kg']:.2f} кг (объём {mp.get('volume_cm3', 0):.1f} см³).")
+                            if result.get("fem"):
+                                details.append(
+                                    f"КЭ-модель: {result.get('n_nodes', 0):,} узлов, {result.get('n_elements', 0):,} "
+                                    "тетраэдров C3D10 (2-й порядок).")
 
-                        pdf_data = build_pdf_report_bytes(selected_material, norm_name, norm_coef, report_rows, preview_png=preview_png, use_fem=use_fem)
+                            if result["analysis_type"] == "Модальный":
+                                f1 = result["first_frequency_hz"]
+                                in_band = f1 is not None and SEISMIC_BAND_HZ[0] <= f1 <= SEISMIC_BAND_HZ[1]
+                                if f1 is not None:
+                                    details.append(f"Первая собственная частота: f1 = {f1:.2f} Гц.")
+                                for m in (result.get("modes") or [])[:5]:
+                                    details.append(f"Тон {m['mode']}: f = {m['f_hz']:.2f} Гц "
+                                                   f"(эфф. массы X/Y/Z: {m['effmass_x_kg']:.2f}/{m['effmass_y_kg']:.2f}/{m['effmass_z_kg']:.2f} кг).")
+                                te = result.get("total_effective_mass_kg")
+                                if te is not None and mp.get("mass_kg"):
+                                    details.append(f"Суммарные эффективные массы (10 тонов): "
+                                                   f"X {te[0]:.2f} / Y {te[1]:.2f} / Z {te[2]:.2f} кг из {mp['mass_kg']:.2f} кг.")
+                                row = {
+                                    "scenario": scenario,
+                                    "analysis_type": result["analysis_type"],
+                                    "temperature": params['temperature'],
+                                    "result_text": f"f1 = {f1:.1f} Гц" if f1 is not None else "f1: н/д",
+                                    "allow_text": "вне 0.5–33 Гц",
+                                    "safety_text": "—",
+                                    "verdict": "Возможен резонанс" if in_band else "Резонанс маловероятен",
+                                    "safety_sort": float("inf"),
+                                    "passed": None,
+                                }
+                            else:
+                                sigma_total = result["sigma_total"]
+                                safety_factor = result["sigma_yield_t"] / sigma_total if sigma_total > 0 else float("inf")
+                                sigma_allow = result["sigma_yield_t"] / norm_eff
+                                details.append(
+                                    f"Максимальное эквивалентное напряжение: σ = {sigma_total:.1f} МПа; "
+                                    f"σт({params['temperature']} °C) = {result['sigma_yield_t']:.1f} МПа; "
+                                    f"[σ] = {sigma_allow:.1f} МПа.")
+                                if result.get("fem"):
+                                    if result.get("sigma_p95") is not None:
+                                        details.append(f"95-й перцентиль напряжений по Мизесу: {result['sigma_p95']:.1f} МПа.")
+                                    if result.get("max_disp_mm") is not None:
+                                        details.append(f"Максимальное перемещение: {result['max_disp_mm'] * 1000:.1f} мкм.")
+                                    if result["analysis_type"] == "Спектральный" and result.get("sigma_spectral") is not None:
+                                        details.append(
+                                            f"Линейно-спектральный метод (SRSS, {len(result.get('modes', []))} тонов, "
+                                            f"ось {result.get('spectrum_axis', '?')}): σ спектральная {result['sigma_spectral']:.1f} МПа "
+                                            f"+ σ статическая (НУЭ) {result['sigma_static_part']:.1f} МПа.")
+                                else:
+                                    details.append(
+                                        f"Составляющие: мембранная {result.get('sigma_membrane', 0):.1f} + "
+                                        f"изгибная {result.get('sigma_bending', 0):.1f} + "
+                                        f"температурная {result.get('sigma_thermal', 0):.1f} МПа.")
+                                row = {
+                                    "scenario": scenario,
+                                    "analysis_type": result["analysis_type"],
+                                    "temperature": params['temperature'],
+                                    "result_text": f"{sigma_total:.1f} МПа",
+                                    "allow_text": f"{sigma_allow:.1f} МПа" + (f" ({params['seism_combo']})" if allow_k > 1.0 else ""),
+                                    "safety_text": f"{safety_factor:.2f}" if np.isfinite(safety_factor) else "∞",
+                                    "verdict": "Пройдён" if safety_factor >= norm_eff else "Не пройдён",
+                                    "safety_sort": safety_factor,
+                                    "passed": bool(safety_factor >= norm_eff),
+                                }
+
+                            preview_coords = result["viz_coords"] if result.get("fem") else coords
+                            row["params_rows"] = params_rows
+                            row["details"] = details
+                            row["recommendations"] = get_engineering_recommendations(result, params, norm_eff)
+                            row["image_png"] = build_nds_preview_png(preview_coords, field, scenario)
+                            report_rows.append(row)
+
+                        mp0 = (scenario_results[0][2].get("mass_props") or {}) if scenario_results else {}
+                        ext = mp0.get("extents_mm")
+                        com = mp0.get("center_of_mass")
+                        model_rows = [("Файл модели", st.session_state.get('stl_name', '—'))]
+                        if ext is not None:
+                            model_rows.append(("Габариты", f"{ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} мм"))
+                        if mp0.get("volume_cm3"):
+                            model_rows.append(("Объём", f"{mp0['volume_cm3']:.1f} см³"))
+                        if mp0.get("mass_kg"):
+                            model_rows.append(("Масса", f"{mp0['mass_kg']:.2f} кг ({selected_material})"))
+                        if com is not None:
+                            model_rows.append(("Центр масс", f"({com[0]:.1f}; {com[1]:.1f}; {com[2]:.1f}) мм"))
+                        if use_fem and fem_mesh is not None:
+                            model_rows.append(("КЭ-сетка", f"{fem_mesh['n_nodes']:,} узлов, {fem_mesh['n_elements']:,} тетраэдров C3D10"))
+                            model_rows.append(("Решатель", "CalculiX (МКЭ, линейно-упругая постановка)"))
+                        else:
+                            model_rows.append(("Поверхностная сетка", f"{len(mesh.vertices):,} вершин, {len(mesh.faces):,} треугольников"))
+                            model_rows.append(("Метод расчёта", "Аналитическая экспресс-оценка"))
+                        model_info = {"file": st.session_state.get('stl_name', '—'), "rows": model_rows}
+                        model_png = build_model_view_png(mesh)
+
+                        pdf_data = build_pdf_report_bytes(
+                            selected_material, norm_name, norm_coef, report_rows,
+                            use_fem=use_fem,
+                            material=MATERIALS_GOST[selected_material],
+                            model_info=model_info,
+                            model_png=model_png,
+                        )
                     if pdf_data is not None:
                         st.session_state['pdf_report'] = pdf_data
                     else:

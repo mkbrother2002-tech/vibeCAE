@@ -31,7 +31,9 @@ jobs:
 
       - name: Install CalculiX and Python dependencies
         run: |
-          conda install --yes --channel conda-forge calculix
+          # Prefer the OpenBLAS variant. The Windows MKL package relies on a
+          # versioned runtime DLL that is not reliably linked into Conda envs.
+          conda install --yes --channel conda-forge calculix "libblas=*=*openblas"
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller appdirs pefile
 
@@ -45,20 +47,16 @@ jobs:
       - name: Build application
         run: |
           python -m PyInstaller --noconfirm --clean packaging/windows/VibeCAELight.spec
-          # PyInstaller may deduplicate versioned DLL aliases. Copy the exact
-          # CalculiX runtime files after COLLECT so both MKL names are retained.
+          # Copy exact CalculiX runtime files after COLLECT so PyInstaller does
+          # not deduplicate or omit external solver dependencies.
           Copy-Item -Path "$env:VIBECAE_CCX_DLL_DIR\*.dll" -Destination "dist/VibeCAE Light/_internal" -Force
 
       - name: Verify packaged files
         run: |
           $exe = "dist/VibeCAE Light/VibeCAE Light.exe"
           $ccx = "dist/VibeCAE Light/_internal/ccx.exe"
-          $mklVersioned = "dist/VibeCAE Light/_internal/mkl_rt.3.dll"
-          $mklAlias = "dist/VibeCAE Light/_internal/mkl_rt.dll"
           if (-not (Test-Path $exe)) { throw "Application executable is missing" }
           if (-not (Test-Path $ccx)) { throw "Bundled CalculiX is missing" }
-          if (-not (Test-Path $mklVersioned)) { throw "Bundled mkl_rt.3.dll is missing" }
-          if (-not (Test-Path $mklAlias)) { throw "Bundled mkl_rt.dll alias is missing" }
 
           # Reproduce a clean user's machine: CalculiX must not resolve DLLs
           # from the active Conda environment through PATH.
@@ -72,7 +70,7 @@ jobs:
           Write-Host $ccxVersion
           if ($ccxVersion -notmatch "This is Version") { throw "Bundled CalculiX failed to report its version" }
           $global:LASTEXITCODE = 0
-          Get-Item $exe, $ccx, $mklVersioned, $mklAlias | Format-Table FullName, Length
+          Get-Item $exe, $ccx | Format-Table FullName, Length
 
       - name: Smoke-test Streamlit startup
         run: |

@@ -1,0 +1,115 @@
+name: Build VibeCAE Light for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/windows-build
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: vibecae-build
+          python-version: "3.11"
+          channels: conda-forge
+          channel-priority: strict
+          auto-activate-base: false
+
+      - name: Install CalculiX and Python dependencies
+        run: |
+          # Prefer the OpenBLAS variant. The Windows MKL package relies on a
+          # versioned runtime DLL that is not reliably linked into Conda envs.
+          conda install --yes --channel conda-forge calculix "libblas=*=*openblas"
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller appdirs pefile
+
+          $ccx = (Get-Command ccx.exe -ErrorAction Stop).Source
+          $ccxDllDir = Join-Path $env:RUNNER_TEMP "ccx-dlls"
+          python packaging/windows/collect_ccx_dlls.py $ccx $ccxDllDir
+          "VIBECAE_CCX_PATH=$ccx" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VIBECAE_CCX_DLL_DIR=$ccxDllDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "CalculiX: $ccx"
+
+      - name: Build application
+        run: |
+          python -m PyInstaller --noconfirm --clean packaging/windows/VibeCAELight.spec
+          # Copy exact CalculiX runtime files after COLLECT so PyInstaller does
+          # not deduplicate or omit external solver dependencies.
+          Copy-Item -Path "$env:VIBECAE_CCX_DLL_DIR\*.dll" -Destination "dist/VibeCAE Light/_internal" -Force
+
+      - name: Verify packaged files
+        run: |
+          $exe = "dist/VibeCAE Light/VibeCAE Light.exe"
+          $ccx = "dist/VibeCAE Light/_internal/ccx.exe"
+          if (-not (Test-Path $exe)) { throw "Application executable is missing" }
+          if (-not (Test-Path $ccx)) { throw "Bundled CalculiX is missing" }
+
+          # Reproduce a clean user's machine: CalculiX must not resolve DLLs
+          # from the active Conda environment through PATH.
+          $buildPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32"
+            $ccxVersion = (& $ccx -v 2>&1 | Out-String)
+          } finally {
+            $env:PATH = $buildPath
+          }
+          Write-Host $ccxVersion
+          if ($ccxVersion -notmatch "This is Version") { throw "Bundled CalculiX failed to report its version" }
+          $global:LASTEXITCODE = 0
+          Get-Item $exe, $ccx | Format-Table FullName, Length
+
+      - name: Smoke-test Streamlit startup
+        run: |
+          $exe = Resolve-Path "dist/VibeCAE Light/VibeCAE Light.exe"
+          $stdout = Join-Path $env:RUNNER_TEMP "vibecae.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "vibecae.stderr.log"
+          $process = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 2
+              if ($process.HasExited) { break }
+              try {
+                $response = Invoke-WebRequest -Uri "http://localhost:8501" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {}
+            }
+            if (-not $ready) {
+              Write-Host "--- stdout ---"
+              if (Test-Path $stdout) { Get-Content $stdout }
+              Write-Host "--- stderr ---"
+              if (Test-Path $stderr) { Get-Content $stderr }
+              throw "VibeCAE Light did not start on localhost:8501"
+            }
+          } finally {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Create ZIP archive
+        run: |
+          Compress-Archive -Path "dist/VibeCAE Light" -DestinationPath "VibeCAE-Light-Windows-x64.zip"
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: VibeCAE-Light-Windows-x64
+          path: VibeCAE-Light-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

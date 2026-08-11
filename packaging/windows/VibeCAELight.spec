@@ -1,10 +1,12 @@
 import os
+from glob import glob
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
 root = os.path.abspath(os.path.join(SPECPATH, "..", ".."))
 ccx_path = os.environ["VIBECAE_CCX_PATH"]
+ccx_dll_dir = os.environ["VIBECAE_CCX_DLL_DIR"]
 
 packages = [
     "streamlit",
@@ -22,6 +24,7 @@ datas = [
     (os.path.join(root, "fem_solver.py"), "."),
 ]
 binaries = [(ccx_path, ".")]
+binaries += [(dll, ".") for dll in glob(os.path.join(ccx_dll_dir, "*.dll"))]
 hiddenimports = ["fem_solver", "appdirs"]
 
 for package in packages:

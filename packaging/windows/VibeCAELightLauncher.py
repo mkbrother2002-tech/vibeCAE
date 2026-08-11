@@ -8,6 +8,10 @@ def resource_path(name):
 
 
 if __name__ == "__main__":
+    # Streamlit asks for an onboarding email on a fresh Windows machine unless
+    # this is set before importing its CLI, which would block app startup.
+    os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+
     ccx = resource_path("ccx.exe")
     if os.path.isfile(ccx):
         os.environ["CCX_PATH"] = ccx

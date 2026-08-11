@@ -35,6 +35,16 @@ def main() -> None:
             for dll in directory.glob("*.dll"):
                 available.setdefault(dll.name.lower(), dll)
 
+    # Conda may install a versioned MKL runtime (for example mkl_rt.3.dll)
+    # while BLAS/LAPACK imports the stable mkl_rt.dll name. Ship both names.
+    if "mkl_rt.dll" not in available:
+        versioned_mkl = sorted(
+            (path for path in available.values() if path.name.lower().startswith("mkl_rt.")),
+            key=lambda path: path.name,
+        )
+        if versioned_mkl:
+            available["mkl_rt.dll"] = versioned_mkl[-1]
+
     destination.mkdir(parents=True, exist_ok=True)
     queue = deque([ccx])
     inspected = {ccx.name.lower()}
@@ -51,9 +61,13 @@ def main() -> None:
             # present in the isolated Conda search directories.
             if dependency is None:
                 continue
-            target = destination / dependency.name
+            target = destination / name
             shutil.copy2(dependency, target)
             copied.append(target)
+            if target.name.lower() != dependency.name.lower():
+                versioned_target = destination / dependency.name
+                shutil.copy2(dependency, versioned_target)
+                copied.append(versioned_target)
             queue.append(dependency)
 
     if not copied:

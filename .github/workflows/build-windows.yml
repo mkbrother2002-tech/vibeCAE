@@ -55,6 +55,7 @@ jobs:
           $ccxVersion = (& $ccx -v 2>&1 | Out-String)
           Write-Host $ccxVersion
           if ($ccxVersion -notmatch "This is Version") { throw "Bundled CalculiX failed to report its version" }
+          $global:LASTEXITCODE = 0
           Get-Item $exe, $ccx | Format-Table FullName, Length
 
       - name: Smoke-test Streamlit startup

@@ -54,11 +54,14 @@ jobs:
       - name: Smoke-test Streamlit startup
         run: |
           $exe = Resolve-Path "dist/VibeCAE Light/VibeCAE Light.exe"
-          $process = Start-Process -FilePath $exe -PassThru
+          $stdout = Join-Path $env:RUNNER_TEMP "vibecae.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "vibecae.stderr.log"
+          $process = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
           try {
             $ready = $false
             for ($i = 0; $i -lt 30; $i++) {
               Start-Sleep -Seconds 2
+              if ($process.HasExited) { break }
               try {
                 $response = Invoke-WebRequest -Uri "http://localhost:8501" -UseBasicParsing -TimeoutSec 2
                 if ($response.StatusCode -eq 200) {
@@ -67,7 +70,13 @@ jobs:
                 }
               } catch {}
             }
-            if (-not $ready) { throw "VibeCAE Light did not start on localhost:8501" }
+            if (-not $ready) {
+              Write-Host "--- stdout ---"
+              if (Test-Path $stdout) { Get-Content $stdout }
+              Write-Host "--- stderr ---"
+              if (Test-Path $stderr) { Get-Content $stderr }
+              throw "VibeCAE Light did not start on localhost:8501"
+            }
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
           }

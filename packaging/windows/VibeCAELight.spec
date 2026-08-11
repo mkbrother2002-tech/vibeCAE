@@ -55,7 +55,9 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,
+    # Keep the console enabled for the first Windows beta so startup errors
+    # remain visible on user machines and can be captured in GitHub Actions.
+    console=True,
 )
 coll = COLLECT(
     exe,

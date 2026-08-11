@@ -11,6 +11,7 @@ if __name__ == "__main__":
     # Streamlit asks for an onboarding email on a fresh Windows machine unless
     # this is set before importing its CLI, which would block app startup.
     os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+    os.environ["STREAMLIT_SERVER_SHOW_EMAIL_PROMPT"] = "false"
 
     ccx = resource_path("ccx.exe")
     if os.path.isfile(ccx):

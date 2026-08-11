@@ -685,8 +685,11 @@ def build_fem_mesh_subprocess(step_bytes, mesh_size_mm=8.0):
         if proc.returncode != 0 or not os.path.exists(out_path):
             tail = (proc.stderr or proc.stdout or "нет вывода").strip().splitlines()[-5:]
             raise RuntimeError("генерация сетки (gmsh): " + " | ".join(tail))
-        data = np.load(out_path, allow_pickle=False)
-        fem = {k: data[k] for k in data.files}
+        # NpzFile keeps the archive handle open. POSIX permits unlinking an
+        # open file, but Windows raises WinError 32 in the finally block below.
+        # Materialize every array and close the archive before cleanup.
+        with np.load(out_path, allow_pickle=False) as data:
+            fem = {k: data[k] for k in data.files}
         fem["volume_mm3"] = float(fem["volume_mm3"])
         fem["n_nodes"] = int(fem["n_nodes"])
         fem["n_elements"] = int(fem["n_elements"])

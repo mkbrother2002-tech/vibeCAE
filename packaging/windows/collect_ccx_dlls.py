@@ -27,13 +27,15 @@ def main() -> None:
     ccx = Path(sys.argv[1]).resolve()
     destination = Path(sys.argv[2]).resolve()
     conda_prefix = Path(os.environ["CONDA_PREFIX"]).resolve()
+    conda_root = Path(os.environ.get("CONDA", conda_prefix)).resolve()
     available: dict[str, Path] = {}
     # MKL's directory layout changes between Conda releases (recent packages
     # place the versioned runtime outside Library/bin), so index the complete
     # build environment instead of relying on a fixed directory list.
-    for dll in conda_prefix.rglob("*"):
-        if dll.is_file() and dll.suffix.lower() == ".dll":
-            available.setdefault(dll.name.lower(), dll)
+    for root in dict.fromkeys((conda_prefix, conda_root)):
+        for dll in root.rglob("*"):
+            if dll.is_file() and dll.suffix.lower() == ".dll":
+                available.setdefault(dll.name.lower(), dll)
 
     # Conda may install a versioned MKL runtime (for example mkl_rt.3.dll)
     # while BLAS/LAPACK imports the stable mkl_rt.dll name. Ship both names.
